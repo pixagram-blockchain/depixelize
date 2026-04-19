@@ -1,902 +1,1327 @@
 // depixelize.js — Resolution-independent vectorization of pixel art.
-// Port of Kopf & Lischinski (2011). Single file, zero dependencies, ~900 lines.
+// Cell-mode-only implementation of Kopf & Lischinski (2011).
+// Single file, zero dependencies. Optimized with TypedArrays and packed
+// integer keys throughout (no string nodes, no Map of Sets where avoidable).
 //
-// Usage (browser):
-//   const svg = depixelize(imageData);            // ImageData -> SVG string
-// Usage (Node):
-//   const svg = depixelize({ data, width, height });   // data: Uint8Array/Uint8ClampedArray RGBA
+// Usage (browser):   const svg = depixelize(imageData);
+// Usage (Node):      const svg = depixelize({ data, width, height });
 //
 // Options:
 //   scale        40     SVG output scale
-//   mode         auto   'shape' | 'cell' | 'auto' (auto picks by palette size)
-//                       shape: smooth spline contours per connected region
-//                              — best for classic pixel art (Mario, Invaders)
-//                       cell:  per-pixel cell polygons under smooth clip silhouettes
-//                              — preserves gradients and photo-like input
-//   smooth       true   run spline smoothing (random relaxation)
+//   smooth       true   run random-relaxation spline smoothing
 //   iterations   20     outer smoothing iterations
 //   guesses      20     random candidates per control point per iteration
 //   guessOffset  0.05   max random displacement in pixel units
 
 'use strict';
 
-// ---------- tiny utilities ----------------------------------------------------
-const key2 = (x, y) => x + ',' + y;                // node key for 2D coords
-const parseKey = s => s.split(',').map(Number);    // "x,y" -> [x, y]
+// ============================================================================
+// Integer key packing
+// ============================================================================
+// Grid corner coordinates are quantized to quarter-pixel after cell
+// deformation, so every corner has coordinates in N/4 where N is an integer.
+// We store positions scaled ×4 (= Q4) so keys are plain ints.
+//
+//   corner key  =  (iy * gw) + ix      where ix,iy in [0..(w+1)*Q4]
+//   pixel key   =   y * w + x          plain raster index
+const Q4 = 4;
 
-// ---------- Graph: adjacency Map with per-edge attribute Map -----------------
-class Graph {
-  constructor() {
-    this.adj  = new Map();   // node -> Set(neighbor)
-    this.attr = new Map();   // unordered-pair-key -> object
-  }
-  _ek(a, b) { return a < b ? a + '|' + b : b + '|' + a; }
-  addNode(n)      { if (!this.adj.has(n)) this.adj.set(n, new Set()); }
-  hasNode(n)      { return this.adj.has(n); }
-  removeNode(n)   {
-    const nb = this.adj.get(n); if (!nb) return;
-    for (const m of nb) { this.adj.get(m).delete(n); this.attr.delete(this._ek(n, m)); }
-    this.adj.delete(n);
-  }
-  addEdge(a, b, at = null) {
-    this.addNode(a); this.addNode(b);
-    this.adj.get(a).add(b); this.adj.get(b).add(a);
-    if (at) this.attr.set(this._ek(a, b), at);
-  }
-  hasEdge(a, b)    { const s = this.adj.get(a); return !!s && s.has(b); }
-  removeEdge(a, b) {
-    const sa = this.adj.get(a), sb = this.adj.get(b);
-    if (sa) sa.delete(b); if (sb) sb.delete(a);
-    this.attr.delete(this._ek(a, b));
-  }
-  edgeAttr(a, b)   { return this.attr.get(this._ek(a, b)); }
-  neighbors(n)     { return this.adj.get(n) || new Set(); }
-  degree(n)        { const s = this.adj.get(n); return s ? s.size : 0; }
-  nodes()          { return this.adj.keys(); }
-  copy() {
-    const g = new Graph();
-    for (const [n, nb] of this.adj) g.adj.set(n, new Set(nb));
-    for (const [k, v] of this.attr) g.attr.set(k, { ...v });
-    return g;
-  }
-  // Connected components of this graph restricted to nodeSet (or all nodes).
-  components(nodeSet) {
-    const pool  = nodeSet ? new Set(nodeSet) : new Set(this.adj.keys());
-    const comps = [];
-    while (pool.size) {
-      const start = pool.values().next().value;
-      const comp  = new Set(); const stack = [start];
-      while (stack.length) {
-        const n = stack.pop();
-        if (comp.has(n) || !pool.has(n)) continue;
-        comp.add(n); pool.delete(n);
-        for (const m of this.adj.get(n)) if (pool.has(m) && !comp.has(m)) stack.push(m);
-      }
-      comps.push(comp);
-    }
-    return comps;
-  }
-  // Induced subgraph: only keeps nodes in nodeSet and edges where both
-  // endpoints are in nodeSet. Critical for shape-boundary tracing — within
-  // a shape's induced subgraph, every boundary node has degree 2 (simple
-  // cycle), so the greedy tracer works correctly.
-  induced(nodeSet) {
-    const g = new Graph();
-    for (const n of nodeSet) if (this.adj.has(n)) g.addNode(n);
-    for (const n of nodeSet) {
-      const nb = this.adj.get(n); if (!nb) continue;
-      for (const m of nb) if (nodeSet.has(m)) {
-        g.adj.get(n).add(m);
-        const k = this._ek(n, m);
-        const a = this.attr.get(k); if (a) g.attr.set(k, a);
-      }
-    }
-    return g;
-  }
-}
-
-// ---------- Similarity & grid graph construction -----------------------------
-class PixelGraph {
-  // thresholds from paper (hqx): ΔY>48, ΔU>7, ΔV>6 on 0..255
-  static Y_T = 48; static U_T = 7; static V_T = 6;
-
-  constructor(w, h, rgba) {
-    this.w = w; this.h = h;
-    // Pack RGB into Uint8Array, one row after another, stride = 3*w.
-    this.rgb = new Uint8Array(w * h * 3);
-    for (let i = 0, j = 0; i < w * h; i++, j += 4) {
-      this.rgb[3*i    ] = rgba[j    ];
-      this.rgb[3*i + 1] = rgba[j + 1];
-      this.rgb[3*i + 2] = rgba[j + 2];
-    }
-    // Precompute YUV for every pixel as Float32 (cheap memory, skip recompute).
-    this.yuv = new Float32Array(w * h * 3);
-    for (let i = 0; i < w * h; i++) {
-      const r = this.rgb[3*i], g = this.rgb[3*i+1], b = this.rgb[3*i+2];
-      const y = 0.299*r + 0.587*g + 0.114*b;
-      this.yuv[3*i    ] = y;
-      this.yuv[3*i + 1] = 0.492 * (b - y);
-      this.yuv[3*i + 2] = 0.877 * (r - y);
-    }
-    this.graph = new Graph();
-    this._build();
-  }
-  idx(x, y)   { return y * this.w + x; }
-  inBounds(x, y, ox = 0, oy = 0) {
-    return (x + ox) >= 0 && (x + ox) < this.w && (y + oy) >= 0 && (y + oy) < this.h;
-  }
-  rgbAt(x, y) {
-    const i = 3 * this.idx(x, y);
-    return (this.rgb[i] << 16) | (this.rgb[i+1] << 8) | this.rgb[i+2];
-  }
-  // YUV-based similarity (paper/hqx). Pixels are "equal" iff all channel diffs
-  // are within thresholds.
-  similar(x0, y0, x1, y1) {
-    const a = 3 * this.idx(x0, y0), b = 3 * this.idx(x1, y1);
-    return Math.abs(this.yuv[a]   - this.yuv[b])   <= PixelGraph.Y_T
-        && Math.abs(this.yuv[a+1] - this.yuv[b+1]) <= PixelGraph.U_T
-        && Math.abs(this.yuv[a+2] - this.yuv[b+2]) <= PixelGraph.V_T;
-  }
-  _build() {
-    const g = this.graph;
-    for (let y = 0; y < this.h; y++) for (let x = 0; x < this.w; x++) {
-      g.addNode(key2(x, y));
-      // 4 of 8 neighbors: right, down, down-right diagonal, up-right diagonal.
-      this._tryEdge(x, y, x + 1, y    );
-      this._tryEdge(x, y, x,     y + 1);
-      this._tryEdge(x, y, x + 1, y - 1);
-      this._tryEdge(x, y, x + 1, y + 1);
-    }
-  }
-  _tryEdge(x0, y0, x1, y1) {
-    if (x1 < 0 || x1 >= this.w || y1 < 0 || y1 >= this.h) return;
-    if (!this.similar(x0, y0, x1, y1)) return;
-    const diag = x0 !== x1 && y0 !== y1;
-    this.graph.addEdge(key2(x0, y0), key2(x1, y1), { diagonal: diag });
-  }
-}
-
-// ---------- Heuristics for resolving ambiguous diagonal pairs ----------------
-class Heuristics {
-  static SPARSE_WINDOW = 8;
-  constructor(pg) { this.pg = pg; this.g = pg.graph; }
-
-  apply(ambiguousPairs) {
-    // Score every diagonal edge in every pair, then remove the lowest-scored.
-    for (const pair of ambiguousPairs) for (const e of pair) {
-      e.weight = this._curve(e) + this._sparse(e) + this._island(e);
-    }
-    for (const pair of ambiguousPairs) {
-      const min = Math.min(...pair.map(e => e.weight));
-      for (const e of pair) {
-        if (e.weight === min) this.g.removeEdge(e.a, e.b);
-      }
-    }
-  }
-  // Length of the maximal valence-2 curve through this edge.
-  _curve(e) {
-    const seen = new Set([e.a < e.b ? e.a+'|'+e.b : e.b+'|'+e.a]);
-    const stack = [e.a, e.b];
-    while (stack.length) {
-      const n = stack.pop();
-      const nb = this.g.neighbors(n);
-      if (nb.size !== 2) continue;                 // junction/endpoint: stop
-      for (const m of nb) {
-        const ek = n < m ? n+'|'+m : m+'|'+n;
-        if (seen.has(ek)) continue;
-        seen.add(ek); stack.push(m);
-      }
-    }
-    return seen.size;
-  }
-  // Negative size of the component within an 8x8 window around the edge.
-  _sparse(e) {
-    const [ax, ay] = parseKey(e.a), [bx, by] = parseKey(e.b);
-    const minx = Math.min(ax, bx), miny = Math.min(ay, by);
-    const W = Heuristics.SPARSE_WINDOW;
-    const ox = W/2 - 1 - minx, oy = W/2 - 1 - miny;
-    const comp = new Set([e.a, e.b]); const stack = [e.a, e.b];
-    while (stack.length) {
-      const n = stack.pop();
-      for (const m of this.g.neighbors(n)) {
-        if (comp.has(m)) continue;
-        const [mx, my] = parseKey(m);
-        if ((mx + ox) >= 0 && (mx + ox) < W && (my + oy) >= 0 && (my + oy) < W) {
-          comp.add(m); stack.push(m);
-        }
-      }
-    }
-    return -comp.size;
-  }
-  // +5 if cutting this edge would orphan a valence-1 endpoint.
-  _island(e) {
-    return (this.g.degree(e.a) === 1 || this.g.degree(e.b) === 1) ? 5 : 0;
-  }
-}
-
-// ---------- Main pipeline ----------------------------------------------------
+// ============================================================================
+// PixelData — full pipeline. All graphs use integer node IDs; adjacency
+// stored in TypedArrays where feasible.
+// ============================================================================
 class PixelData {
   constructor(w, h, rgba) {
-    this.pg = new PixelGraph(w, h, rgba);
-    this.w  = w; this.h = h;
-    this.gg = new Graph();          // grid (corner) graph
-    // Each pixel stores its polygon-cell corner set (initially the 4 square corners).
-    this.corners = new Map();       // pixel-key -> Set(corner-key)
-    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-      this.corners.set(key2(x, y), new Set([
-        key2(x,   y  ), key2(x+1, y  ),
-        key2(x,   y+1), key2(x+1, y+1),
-      ]));
+    this.w = w; this.h = h;
+    const N = w * h;
+
+    // ---- pack RGB (0xRRGGBB) + YUV diffs ---------------------------------
+    const rgb = this.rgb = new Uint32Array(N);
+    const yuv = this.yuv = new Int16Array(N * 3);
+    for (let i = 0, j = 0; i < N; i++, j += 4) {
+      const r = rgba[j], g = rgba[j+1], b = rgba[j+2];
+      rgb[i] = (r << 16) | (g << 8) | b;
+      const y = (77 * r + 150 * g + 29 * b) >> 8;    // ~0.299r + 0.587g + 0.114b
+      yuv[i*3    ] = y;
+      yuv[i*3 + 1] = (126 * (b - y)) >> 8;           // ~0.492 * (b - y)
+      yuv[i*3 + 2] = (224 * (r - y)) >> 8;           // ~0.877 * (r - y)
     }
-  }
-  run() {
+
+    // ---- pixel similarity graph -----------------------------------------
+    // 4 forward-direction bits per pixel in a Uint8Array.
+    //   bit 0 : +x             bit 1 : +y
+    //   bit 2 : +x+y (SE)      bit 3 : +x-y (NE)
+    // Backward edges read from the neighbor's forward bit — no duplication.
+    this.neigh = new Uint8Array(N);
+    this._buildSimilarityGraph();
     this._removeDiagonals();
-    this._buildGrid();
+
+    // ---- corner grid ----------------------------------------------------
+    this.gw = (w + 1) * Q4 + 1;
+    this.gh = (h + 1) * Q4 + 1;
+    this.grid = new FixedGraph(this.gw * this.gh);
+
+    // Per-pixel corner sets. Fixed-stride Uint32Array: cornerBuf[i*8 .. +7],
+    // counts in cornerCount[i]. Overflow (rare) spills to cornerOver Map.
+    this.cornerBuf   = new Uint32Array(N * 8);
+    this.cornerCount = new Uint8Array(N);
+    this.cornerOver  = null;
+
+    this._buildGridGraph();
     this._deformGrid();
+
+    // ---- shapes, outlines, paths ---------------------------------------
+    // Size the shared localIdxMap for this image.
+    if (localIdxMap.length < this.gw * this.gh) {
+      localIdxMap = new Int32Array(this.gw * this.gh);
+    } else {
+      localIdxMap.fill(0);
+    }
     this._findShapes();
     this._findOutlines();
-    this._assignBoundariesToShapes();
+    this._assignPaths();
   }
 
-  // ---- planarize similarity graph --------------------------------------------
+  // ---- similarity test (hot) ------------------------------------------
+  similar(ai, bi) {
+    const y = this.yuv;
+    const dy = y[ai*3  ] - y[bi*3  ]; if (dy >  48 || dy < -48) return false;
+    const du = y[ai*3+1] - y[bi*3+1]; if (du >   7 || du <  -7) return false;
+    const dv = y[ai*3+2] - y[bi*3+2]; if (dv >   6 || dv <  -6) return false;
+    return true;
+  }
+
+  _buildSimilarityGraph() {
+    const { w, h, neigh } = this;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      if (x + 1 < w && this.similar(i, i + 1))                  neigh[i] |= 1;
+      if (y + 1 < h && this.similar(i, i + w))                  neigh[i] |= 2;
+      if (x + 1 < w && y + 1 < h && this.similar(i, i + w + 1)) neigh[i] |= 4;
+      if (x + 1 < w && y > 0     && this.similar(i, i - w + 1)) neigh[i] |= 8;
+    }
+  }
+
+  // Enumerate all pixel neighbors of pixel i. Used in hot loops — avoid
+  // generators here by writing into a caller-supplied scratch buffer.
+  // Returns count of neighbors written.
+  pxNeighbors(i, out) {
+    const w = this.w, h = this.h, neigh = this.neigh;
+    const x = i % w, y = (i / w) | 0;
+    const n = neigh[i];
+    let c = 0;
+    if (n & 1) out[c++] = i + 1;
+    if (n & 2) out[c++] = i + w;
+    if (n & 4) out[c++] = i + w + 1;
+    if (n & 8) out[c++] = i - w + 1;
+    if (x > 0     && (neigh[i - 1]     & 1)) out[c++] = i - 1;
+    if (y > 0     && (neigh[i - w]     & 2)) out[c++] = i - w;
+    if (x > 0 && y > 0     && (neigh[i - w - 1] & 4)) out[c++] = i - w - 1;
+    if (x > 0 && y + 1 < h && (neigh[i + w - 1] & 8)) out[c++] = i + w - 1;
+    return c;
+  }
+
+  pxDegree(i) {
+    const w = this.w, h = this.h, neigh = this.neigh;
+    const x = i % w, y = (i / w) | 0;
+    const n = neigh[i];
+    let d = (n & 1) + ((n >> 1) & 1) + ((n >> 2) & 1) + ((n >> 3) & 1);
+    if (x > 0     &&     (neigh[i - 1]     & 1)) d++;
+    if (y > 0     &&     (neigh[i - w]     & 2)) d++;
+    if (x > 0 && y > 0     && (neigh[i - w - 1] & 4)) d++;
+    if (x > 0 && y + 1 < h && (neigh[i + w - 1] & 8)) d++;
+    return d;
+  }
+
+  _rmPxEdge(a, b) {
+    const w = this.w;
+    const ax = a % w, ay = (a / w) | 0;
+    const bx = b % w, by = (b / w) | 0;
+    const dx = bx - ax, dy = by - ay;
+    if      (dx ===  1 && dy ===  0) this.neigh[a] &= ~1;
+    else if (dx ===  0 && dy ===  1) this.neigh[a] &= ~2;
+    else if (dx ===  1 && dy ===  1) this.neigh[a] &= ~4;
+    else if (dx ===  1 && dy === -1) this.neigh[a] &= ~8;
+    else if (dx === -1 && dy ===  0) this.neigh[b] &= ~1;
+    else if (dx ===  0 && dy === -1) this.neigh[b] &= ~2;
+    else if (dx === -1 && dy === -1) this.neigh[b] &= ~4;
+    else if (dx === -1 && dy ===  1) this.neigh[b] &= ~8;
+  }
+
+  // ==========================================================================
+  // Diagonal removal + heuristics.
+  // ==========================================================================
   _removeDiagonals() {
-    const g = this.pg.graph, ambiguous = [];
-    for (let y = 0; y < this.h - 1; y++) for (let x = 0; x < this.w - 1; x++) {
-      const nodes = [key2(x,y), key2(x+1,y), key2(x,y+1), key2(x+1,y+1)];
-      // Collect edges internal to this 2x2 block.
-      const edges = [];
-      for (let i = 0; i < 4; i++) for (let j = i + 1; j < 4; j++) {
-        if (g.hasEdge(nodes[i], nodes[j])) {
-          const at = g.edgeAttr(nodes[i], nodes[j]);
-          edges.push({ a: nodes[i], b: nodes[j], diagonal: at.diagonal });
+    const { w, h, neigh } = this;
+    const ambiguous = [];
+    for (let y = 0; y < h - 1; y++) for (let x = 0; x < w - 1; x++) {
+      const tl = y * w + x, tr = tl + 1, bl = tl + w, br = bl + 1;
+      const eTL_TR = (neigh[tl] & 1) !== 0;
+      const eBL_BR = (neigh[bl] & 1) !== 0;
+      const eTL_BL = (neigh[tl] & 2) !== 0;
+      const eTR_BR = (neigh[tr] & 2) !== 0;
+      const eTL_BR = (neigh[tl] & 4) !== 0;
+      const eBL_TR = (neigh[bl] & 8) !== 0;
+      if (!eTL_BR || !eBL_TR) continue;
+      const card = (eTL_TR?1:0)+(eBL_BR?1:0)+(eTL_BL?1:0)+(eTR_BR?1:0);
+      if (card === 4) {
+        neigh[tl] &= ~4;
+        neigh[bl] &= ~8;
+      } else if (card === 0) {
+        ambiguous.push(tl, br, bl, tr);   // flat: a1,b1,a2,b2
+      }
+    }
+    if (ambiguous.length) this._applyHeuristics(ambiguous);
+  }
+
+  _hCurve(a, b, seenScratch) {
+    seenScratch.fill(0);
+    seenScratch[a] = 1; seenScratch[b] = 1;
+    const stack = [a, b];
+    let count = 2;
+    const nbs = new Int32Array(8);
+    while (stack.length) {
+      const n = stack.pop();
+      if (this.pxDegree(n) !== 2) continue;
+      const nc = this.pxNeighbors(n, nbs);
+      for (let k = 0; k < nc; k++) {
+        const m = nbs[k];
+        if (!seenScratch[m]) { seenScratch[m] = 1; count++; stack.push(m); }
+      }
+    }
+    return count;
+  }
+  _hSparse(a, b, seenScratch) {
+    const w = this.w;
+    const ax = a % w, ay = (a / w) | 0;
+    const bx = b % w, by = (b / w) | 0;
+    const ox = 3 - Math.min(ax, bx), oy = 3 - Math.min(ay, by);
+    seenScratch.fill(0);
+    seenScratch[a] = 1; seenScratch[b] = 1;
+    const stack = [a, b];
+    let count = 2;
+    const nbs = new Int32Array(8);
+    while (stack.length) {
+      const n = stack.pop();
+      const nc = this.pxNeighbors(n, nbs);
+      for (let k = 0; k < nc; k++) {
+        const m = nbs[k];
+        if (seenScratch[m]) continue;
+        const mx = m % w, my = (m / w) | 0;
+        const px = mx + ox, py = my + oy;
+        if (px >= 0 && px < 8 && py >= 0 && py < 8) {
+          seenScratch[m] = 1; count++; stack.push(m);
         }
       }
-      const diag = edges.filter(e => e.diagonal);
-      if (diag.length !== 2) continue;          // no crossing to resolve
-      if (edges.length === 6)      diag.forEach(e => g.removeEdge(e.a, e.b));   // flat block
-      else if (edges.length === 2) ambiguous.push(diag);                        // X only
     }
-    new Heuristics(this.pg).apply(ambiguous);
+    return -count;
+  }
+  _hIsland(a, b) {
+    return (this.pxDegree(a) === 1 || this.pxDegree(b) === 1) ? 5 : 0;
+  }
+  _applyHeuristics(flat) {
+    const seen = new Uint8Array(this.w * this.h);
+    for (let k = 0; k < flat.length; k += 4) {
+      const a1 = flat[k], b1 = flat[k+1], a2 = flat[k+2], b2 = flat[k+3];
+      const w1 = this._hCurve(a1, b1, seen) + this._hSparse(a1, b1, seen) + this._hIsland(a1, b1);
+      const w2 = this._hCurve(a2, b2, seen) + this._hSparse(a2, b2, seen) + this._hIsland(a2, b2);
+      if (w1 <= w2) this._rmPxEdge(a1, b1);
+      if (w2 <= w1) this._rmPxEdge(a2, b2);
+    }
   }
 
-  // ---- (w+1)x(h+1) square-corner grid ---------------------------------------
-  _buildGrid() {
-    for (let y = 0; y <= this.h; y++) for (let x = 0; x <= this.w; x++) {
-      const k = key2(x, y); this.gg.addNode(k);
-      if (x < this.w) this.gg.addEdge(k, key2(x + 1, y));
-      if (y < this.h) this.gg.addEdge(k, key2(x,     y + 1));
+  // ==========================================================================
+  // Grid graph on the quarter-pixel lattice.
+  // ==========================================================================
+  _buildGridGraph() {
+    const { w, h, gw } = this;
+    const grid = this.grid;
+    // Fast direct writes: during build every edge is unique, skip hasEdge.
+    const exists = grid.exists, adj = grid.adj, deg = grid.deg;
+    const GW4 = gw * Q4;    // row stride in corner keys
+    for (let y = 0; y <= h; y++) {
+      const rowBase = y * GW4;
+      for (let x = 0; x <= w; x++) {
+        const k = rowBase + x * Q4;
+        exists[k] = 1;
+        if (x < w) {
+          const r = rowBase + (x + 1) * Q4;
+          adj[k * MAX_DEG + deg[k]++] = r;
+          adj[r * MAX_DEG + deg[r]++] = k;
+        }
+        if (y < h) {
+          const d = rowBase + GW4 + x * Q4;
+          adj[k * MAX_DEG + deg[k]++] = d;
+          adj[d * MAX_DEG + deg[d]++] = k;
+        }
+      }
+    }
+    // Initial 4 corners per pixel — direct buffer writes.
+    const cBuf = this.cornerBuf, cCnt = this.cornerCount;
+    for (let y = 0; y < h; y++) {
+      const top = y * Q4 * gw;
+      const bot = (y + 1) * Q4 * gw;
+      for (let x = 0; x < w; x++) {
+        const i = y * w + x;
+        const leftQ  = x * Q4;
+        const rightQ = (x + 1) * Q4;
+        const base = i * 8;
+        cBuf[base    ] = top + leftQ;
+        cBuf[base + 1] = top + rightQ;
+        cBuf[base + 2] = bot + leftQ;
+        cBuf[base + 3] = bot + rightQ;
+        cCnt[i] = 4;
+      }
     }
   }
 
-  // ---- deform cells to follow similarity graph, then collapse valence-2 ------
+  // Write corner keys of pixel pi into out[]; return count.
+  cornersArray(pi, out) {
+    if (this.cornerOver) {
+      const s = this.cornerOver.get(pi);
+      if (s) { let i = 0; for (const k of s) out[i++] = k; return i; }
+    }
+    const base = pi * 8, n = this.cornerCount[pi];
+    for (let j = 0; j < n; j++) out[j] = this.cornerBuf[base + j];
+    return n;
+  }
+
+  // ==========================================================================
+  // Cell deformation.
+  // ==========================================================================
   _deformGrid() {
-    const g = this.pg.graph;
-    for (const node of g.nodes()) {
-      const [x, y] = parseKey(node);
-      for (const nb of g.neighbors(node)) {
-        const [nx, ny] = parseKey(nb);
-        if (nx === x || ny === y) continue;       // cardinal, skip
-        this._deformCell(x, y, nx, ny);
+    const { w, h, neigh } = this;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      const n = neigh[i];
+      if (n & 4) this._deformCell(x, y, x + 1, y + 1);
+      if (n & 8) this._deformCell(x, y, x + 1, y - 1);
+      if (x > 0 && y > 0     && (neigh[i - w - 1] & 4)) this._deformCell(x, y, x - 1, y - 1);
+      if (x > 0 && y + 1 < h && (neigh[i + w - 1] & 8)) this._deformCell(x, y, x - 1, y + 1);
+    }
+    // Collapse valence-2 corner nodes. Preserve image corners.
+    const gw = this.gw;
+    const keep0 = 0,
+          keep1 = w * Q4,
+          keep2 = (h * Q4) * gw,
+          keep3 = keep2 + keep1;
+    const grid = this.grid;
+    const nbs = new Uint32Array(MAX_DEG);
+    // Walk the exists mask directly — much faster than a generator.
+    const exists = grid.exists, deg = grid.deg;
+    const cap = grid.capacity;
+    // Two-phase: collect nodes to collapse, then process. Collapsing can
+    // cascade, so we iterate to a fixed point.
+    const removals = [];
+    for (let node = 0; node < cap; node++) {
+      if (!exists[node]) continue;
+      if (node === keep0 || node === keep1 || node === keep2 || node === keep3) continue;
+      const d = deg[node];
+      if (d <= 2) {
+        if (d === 2) {
+          grid.neighborsInto(node, nbs);
+          grid.addEdge(nbs[0], nbs[1]);
+        }
+        removals.push(node);
       }
     }
-    // Collapse valence-2 corner nodes for smoother cells. Keep the 4 image corners.
-    const keep = new Set([key2(0,0), key2(0,this.h), key2(this.w,0), key2(this.w,this.h)]);
-    const toRemove = [];
-    for (const node of this.gg.nodes()) {
-      if (keep.has(node)) continue;
-      const nb = [...this.gg.neighbors(node)];
-      if (nb.length === 2) this.gg.addEdge(nb[0], nb[1]);
-      if (nb.length <= 2)  toRemove.push(node);
+    for (let k = 0; k < removals.length; k++) grid.removeNode(removals[k]);
+    // Drop stale corner refs from pixel corner sets.
+    for (let i = 0; i < w * h; i++) {
+      if (this.cornerOver && this.cornerOver.has(i)) {
+        const s = this.cornerOver.get(i);
+        for (const c of s) if (!grid.hasNode(c)) s.delete(c);
+        continue;
+      }
+      const base = i * 8; let cnt = this.cornerCount[i];
+      for (let j = 0; j < cnt; ) {
+        if (!grid.hasNode(this.cornerBuf[base + j])) {
+          this.cornerBuf[base + j] = this.cornerBuf[base + cnt - 1];
+          cnt--;
+        } else j++;
+      }
+      this.cornerCount[i] = cnt;
     }
-    for (const n of toRemove) this.gg.removeNode(n);
-    // Drop stale corners from each pixel's set.
-    for (const [, cs] of this.corners) for (const c of cs) if (!this.gg.hasNode(c)) cs.delete(c);
   }
 
-  // For one diagonal pair, chamfer the shared corner on each "nibbling" side.
+  // Chamfer the shared corner between pixel (x,y) and diagonal neighbor
+  // (nx,ny) in response to a blocking cardinal. Fully inlined for speed.
   _deformCell(x, y, nx, ny) {
+    const { w, h, rgb, gw, cornerBuf, cornerCount } = this;
+    const grid = this.grid;
+    const gAdj = grid.adj, gDeg = grid.deg, gExi = grid.exists;
+
     const px = Math.max(x, nx), py = Math.max(y, ny);
-    const ox = nx - x, oy = ny - y;                    // ±1 each
-    const pixnode = key2(px, py);
-    // The two adjacent cardinal neighbors of the same shape as (x,y).
-    const testChamfer = (adjX, adjY, pn, mpn, npn) => {
-      if (adjX < 0 || adjY < 0 || adjX >= this.w || adjY >= this.h) return;
-      if (this.pg.rgbAt(x, y) === this.pg.rgbAt(adjX, adjY)) return;  // same color: no chamfer
-      const adjK = key2(adjX, adjY);
-      this.corners.get(adjK).delete(pixnode);          // remove pre-chamfer corner
-      this.corners.get(adjK).add(npn);
-      this.corners.get(key2(x, y)).add(npn);
-      this._deformEdge(pixnode, pn, mpn, npn);
-    };
-    // "horizontal" neighbor test
-    testChamfer(nx, y,
-      key2(px, py - oy),
-      key2(px, py - 0.5 * oy),
-      key2(px + 0.25 * ox, py - 0.25 * oy),
-    );
-    // "vertical" neighbor test
-    testChamfer(x, ny,
-      key2(px - ox,      py),
-      key2(px - 0.5 * ox, py),
-      key2(px - 0.25 * ox, py + 0.25 * oy),
-    );
+    const ox = nx - x, oy = ny - y;
+    const Q2 = Q4 >> 1, Q1 = Q4 >> 2;
+    const pxQ = px * Q4, pyQ = py * Q4;
+    const pixnode = pyQ * gw + pxQ;
+    const me = y * w + x;
+    const meColor = rgb[me];
+
+    // --- horizontal cardinal at (nx, y) ------------------------------
+    if (nx >= 0 && nx < w) {
+      const adj = y * w + nx;
+      if (rgb[adj] !== meColor) {
+        const pn  = (pyQ - oy * Q4) * gw + pxQ;
+        const mpn = (pyQ - oy * Q2) * gw + pxQ;
+        const npn = (pyQ - oy * Q1) * gw + (pxQ + ox * Q1);
+        // corner ops on `adj`
+        if (this.cornerOver && this.cornerOver.has(adj)) {
+          const s = this.cornerOver.get(adj);
+          s.delete(pixnode); s.add(npn);
+        } else {
+          const base = adj * 8; let cnt = cornerCount[adj];
+          for (let j = 0; j < cnt; j++) if (cornerBuf[base + j] === pixnode) {
+            cornerBuf[base + j] = cornerBuf[base + cnt - 1];
+            cnt--; break;
+          }
+          // add npn if not present
+          let has = false;
+          for (let j = 0; j < cnt; j++) if (cornerBuf[base + j] === npn) { has = true; break; }
+          if (!has) {
+            if (cnt < 8) { cornerBuf[base + cnt++] = npn; }
+            else { this._spillAdd(adj, npn); }
+          }
+          cornerCount[adj] = cnt;
+        }
+        // corner ops on `me`: add npn if not present
+        if (this.cornerOver && this.cornerOver.has(me)) {
+          this.cornerOver.get(me).add(npn);
+        } else {
+          const base = me * 8; let cnt = cornerCount[me];
+          let has = false;
+          for (let j = 0; j < cnt; j++) if (cornerBuf[base + j] === npn) { has = true; break; }
+          if (!has) {
+            if (cnt < 8) { cornerBuf[base + cnt++] = npn; }
+            else { this._spillAdd(me, npn); }
+          }
+          cornerCount[me] = cnt;
+        }
+        // edge ops
+        this._deformEdgeInlined(pixnode, pn, mpn, npn);
+      }
+    }
+
+    // --- vertical cardinal at (x, ny) --------------------------------
+    if (ny >= 0 && ny < h) {
+      const adj = ny * w + x;
+      if (rgb[adj] !== meColor) {
+        const pn  = pyQ * gw + (pxQ - ox * Q4);
+        const mpn = pyQ * gw + (pxQ - ox * Q2);
+        const npn = (pyQ + oy * Q1) * gw + (pxQ - ox * Q1);
+        if (this.cornerOver && this.cornerOver.has(adj)) {
+          const s = this.cornerOver.get(adj);
+          s.delete(pixnode); s.add(npn);
+        } else {
+          const base = adj * 8; let cnt = cornerCount[adj];
+          for (let j = 0; j < cnt; j++) if (cornerBuf[base + j] === pixnode) {
+            cornerBuf[base + j] = cornerBuf[base + cnt - 1];
+            cnt--; break;
+          }
+          let has = false;
+          for (let j = 0; j < cnt; j++) if (cornerBuf[base + j] === npn) { has = true; break; }
+          if (!has) {
+            if (cnt < 8) { cornerBuf[base + cnt++] = npn; }
+            else { this._spillAdd(adj, npn); }
+          }
+          cornerCount[adj] = cnt;
+        }
+        if (this.cornerOver && this.cornerOver.has(me)) {
+          this.cornerOver.get(me).add(npn);
+        } else {
+          const base = me * 8; let cnt = cornerCount[me];
+          let has = false;
+          for (let j = 0; j < cnt; j++) if (cornerBuf[base + j] === npn) { has = true; break; }
+          if (!has) {
+            if (cnt < 8) { cornerBuf[base + cnt++] = npn; }
+            else { this._spillAdd(me, npn); }
+          }
+          cornerCount[me] = cnt;
+        }
+        this._deformEdgeInlined(pixnode, pn, mpn, npn);
+      }
+    }
   }
 
-  _deformEdge(pixnode, pn, mpn, npn) {
-    if (this.gg.hasNode(mpn)) {
-      this.gg.removeEdge(mpn, pixnode);
+  // Fallback when a pixel exceeds 8 corners — spill to a Map<Set>.
+  _spillAdd(pi, k) {
+    if (!this.cornerOver) this.cornerOver = new Map();
+    let s = this.cornerOver.get(pi);
+    if (!s) {
+      s = new Set();
+      const base = pi * 8, n = this.cornerCount[pi];
+      for (let j = 0; j < n; j++) s.add(this.cornerBuf[base + j]);
+      this.cornerOver.set(pi, s);
+    }
+    s.add(k);
+  }
+
+  _deformEdgeInlined(pixnode, pn, mpn, npn) {
+    const grid = this.grid;
+    if (grid.exists[mpn]) {
+      grid.removeEdge(mpn, pixnode);
     } else {
-      this.gg.removeEdge(pn, pixnode);
-      this.gg.addEdge(pn, mpn);
+      grid.removeEdge(pn, pixnode);
+      grid.addEdge(pn, mpn);
     }
-    this.gg.addEdge(mpn, npn);
-    this.gg.addEdge(npn, pixnode);
+    grid.addEdge(mpn, npn);
+    grid.addEdge(npn, pixnode);
   }
 
-  // ---- group similar pixels into Shape instances -----------------------------
+  // ==========================================================================
+  // Shapes (connected same-color pixels).
+  // ==========================================================================
   _findShapes() {
+    const N = this.w * this.h;
+    const comp = new Int32Array(N); comp.fill(-1);
     this.shapes = [];
-    for (const comp of this.pg.graph.components()) {
-      const pixels = [...comp];
-      const [x, y] = parseKey(pixels[0]);
-      const color  = this.pg.rgbAt(x, y);
-      const cset   = new Set();
-      for (const p of pixels) for (const c of this.corners.get(p)) cset.add(c);
-      this.shapes.push(new Shape(pixels, color, cset));
-    }
-  }
-
-  // ---- outline graph = grid graph minus intra-shape edges --------------------
-  _findOutlines() {
-    this.outlines = this.gg.copy();
-    const g = this.pg.graph;
-    for (const pix of g.nodes()) {
-      const cs = this.corners.get(pix);
-      for (const nb of g.neighbors(pix)) {
-        const shared = [];
-        const nbCs = this.corners.get(nb);
-        for (const c of cs) if (nbCs.has(c)) shared.push(c);
-        if (shared.length === 2 && this.outlines.hasEdge(shared[0], shared[1])) {
-          this.outlines.removeEdge(shared[0], shared[1]);
+    const stack = new Int32Array(N);
+    const nbs   = new Int32Array(8);
+    for (let i = 0; i < N; i++) {
+      if (comp[i] !== -1) continue;
+      const id = this.shapes.length;
+      let sp = 0; stack[sp++] = i; comp[i] = id;
+      const pixels = [];
+      while (sp) {
+        const n = stack[--sp];
+        pixels.push(n);
+        const nc = this.pxNeighbors(n, nbs);
+        for (let k = 0; k < nc; k++) {
+          const m = nbs[k];
+          if (comp[m] === -1) { comp[m] = id; stack[sp++] = m; }
         }
       }
+      this.shapes.push({ id, color: this.rgb[pixels[0]], pixels, outer: null, holes: [] });
     }
-    // drop isolated corners
-    for (const n of [...this.outlines.nodes()]) if (this.outlines.degree(n) === 0) this.outlines.removeNode(n);
+    this.pixelShape = comp;
   }
 
-  // ---- each shape's boundary is the outline subgraph on its corner set ------
-  _assignBoundariesToShapes() {
-    this.paths = new Map();                            // key -> Path (dedup)
+  // ==========================================================================
+  // Outline graph = grid minus intra-shape edges.
+  // Optimization: build outline by copying grid then removing intra-shape
+  // boundary edges. Inner loop uses a small Uint8 lookup keyed by corner
+  // value (cap-sized; reset via bumping a version).
+  // ==========================================================================
+  _findOutlines() {
+    this.outline = this.grid.copy();
+    const N = this.w * this.h;
+    const outline = this.outline;
+    const nbs = new Int32Array(8);
+    const ci  = new Uint32Array(16);
+    // Lazy-initialized shared marker sized to grid capacity.
+    if (!this._cornerMark || this._cornerMark.length < outline.capacity) {
+      this._cornerMark = new Uint32Array(outline.capacity);
+    }
+    const mark = this._cornerMark;
+    let mver = this._cornerVer | 0;
+
+    for (let i = 0; i < N; i++) {
+      const ncount = this.pxNeighbors(i, nbs);
+      if (ncount === 0) continue;
+      // Mark corners of i with a fresh version.
+      mver++;
+      const ciCount = this.cornersArray(i, ci);
+      for (let p = 0; p < ciCount; p++) mark[ci[p]] = mver;
+
+      for (let k = 0; k < ncount; k++) {
+        const j = nbs[k];
+        if (j < i) continue;
+        // Walk corners of j, find the (up to 2) that are also marked.
+        // Using the fast Uint32 lookup path directly avoids calling cornersArray(j).
+        let a = -1, b = -1;
+        if (this.cornerOver && this.cornerOver.has(j)) {
+          for (const c of this.cornerOver.get(j)) {
+            if (mark[c] === mver) {
+              if (a === -1) a = c; else { b = c; break; }
+            }
+          }
+        } else {
+          const base = j * 8, cnt = this.cornerCount[j];
+          for (let q = 0; q < cnt; q++) {
+            const c = this.cornerBuf[base + q];
+            if (mark[c] === mver) {
+              if (a === -1) a = c; else { b = c; break; }
+            }
+          }
+        }
+        if (b !== -1 && outline.hasEdge(a, b)) outline.removeEdge(a, b);
+      }
+    }
+    this._cornerVer = mver;
+  }
+
+  // ==========================================================================
+  // Per-shape boundary paths + spline fit. Each shape gets its induced
+  // subgraph on the outline graph; components become closed curves.
+  // Optimization: instead of Set<cornerKey> and Map<cornerKey, array[]> per
+  // shape, we use a global Uint8Array mask + per-corner neighbor lists
+  // reused across shapes. The induced-subgraph calculation becomes a couple
+  // of tight typed-array loops.
+  // ==========================================================================
+  _assignPaths() {
+    this.paths = [];
+    const pathIndex = new Map();
+    const gw = this.gw;
+    const outline = this.outline;
+    const cap = outline.capacity;
+    const cBuf = new Uint32Array(16);
+    // Persistent per-corner mask of "is in current shape's corner set"
+    // Bumped version per shape lets us avoid clearing between shapes.
+    const inShape = new Uint32Array(cap);
+    let shapeVer = 0;
+
+    // Scratch: flat representation of this shape's corner list + induced
+    // adjacency as per-corner arrays. Grow on demand.
+    let shapeCorners = new Uint32Array(128);
+    let inducedAdj = new Uint32Array(128 * MAX_DEG);
+    let inducedDeg = new Uint8Array(128);
+
+    // BFS scratch
+    const visited = new Uint32Array(cap);      // 0 if unvisited in this shape, shapeVer if visited
+    let visitVer = 0;
+    const stack = new Int32Array(cap);
+
     for (const shape of this.shapes) {
-      const allCorners = [...shape.corners].filter(c => this.outlines.hasNode(c));
-      if (!allCorners.length) continue;
-      // Induced subgraph on this shape's corners only. Within the induced
-      // graph each boundary node has degree 2, making each connected
-      // component a simple cycle that the greedy tracer can walk cleanly.
-      const sg = this.outlines.induced(new Set(allCorners));
-      const lexMin = allCorners.reduce((a, b) => minKey(a, b));
-      for (const comp of sg.components()) {
-        const path = this._makePath(sg, comp);
-        if (!path) continue;
-        const isOuter = comp.has(lexMin);
-        shape.addOutline(path, isOuter);
+      // Render threshold: shapes below MIN_SMOOTH_PIXELS are painted only by
+      // the NN backdrop in the SVG, so we don't need paths for them. Skip.
+      if (shape.pixels.length < 4) continue;
+      shapeVer++;
+      // Collect on-outline corners for this shape into shapeCorners[].
+      let cn = 0;
+      for (let pk = 0; pk < shape.pixels.length; pk++) {
+        const pi = shape.pixels[pk];
+        const k = this.cornersArray(pi, cBuf);
+        for (let j = 0; j < k; j++) {
+          const c = cBuf[j];
+          if (outline.exists[c] && inShape[c] !== shapeVer) {
+            inShape[c] = shapeVer;
+            if (cn >= shapeCorners.length) {
+              const nb = new Uint32Array(shapeCorners.length * 2);
+              nb.set(shapeCorners); shapeCorners = nb;
+            }
+            shapeCorners[cn++] = c;
+          }
+        }
+      }
+      if (cn < 3) continue;
+
+      // Build induced adjacency. For each corner c in shapeCorners, filter
+      // its outline neighbors to those also in inShape. Store neighbors as
+      // LOCAL INDEX into shapeCorners[] (so subsequent ops work in a dense
+      // 0..cn-1 index space rather than sparse corner keys).
+      // Growth of induced arrays to match cn.
+      if (cn > inducedDeg.length) {
+        let cap2 = inducedDeg.length; while (cap2 < cn) cap2 *= 2;
+        inducedAdj = new Uint32Array(cap2 * MAX_DEG);
+        inducedDeg = new Uint8Array(cap2);
+      } else {
+        for (let i = 0; i < cn; i++) inducedDeg[i] = 0;
+      }
+      // Map corner key -> local index: reuse the `inShape` array by writing
+      // the local index +1 there (we already know c is in shape because
+      // inShape[c] === shapeVer; store (shapeVer << 16) | (localIdx+1)).
+      // Simpler: use a separate Int32Array keyed by corner.
+      // We'll just reuse the visited buffer — it's safe since shapeVer !== visitVer yet.
+      // Local mapping: cornerKey -> local index in [1..cn]
+      for (let i = 0; i < cn; i++) localIdxMap[shapeCorners[i]] = i + 1;
+
+      const adjBuf = outline.adj, degBuf = outline.deg;
+      let lexMin = shapeCorners[0], lexMinX = lexMin % gw, lexMinY = (lexMin / gw) | 0;
+      for (let i = 1; i < cn; i++) {
+        const c = shapeCorners[i];
+        const cx = c % gw, cy = (c / gw) | 0;
+        if (cx < lexMinX || (cx === lexMinX && cy < lexMinY)) { lexMin = c; lexMinX = cx; lexMinY = cy; }
+      }
+      const lexMinLocal = localIdxMap[lexMin] - 1;
+
+      // Build induced adjacency in local indices.
+      for (let i = 0; i < cn; i++) {
+        const c = shapeCorners[i];
+        const base = c * MAX_DEG, d = degBuf[c];
+        const iBase = i * MAX_DEG;
+        let ld = 0;
+        for (let k = 0; k < d; k++) {
+          const m = adjBuf[base + k];
+          const li = localIdxMap[m];
+          if (li !== 0) {
+            // localIdxMap only holds current shape's corners (we wrote it
+            // above; other shapes' writes are stale but collide — we have
+            // to validate via inShape[]).
+            if (inShape[m] === shapeVer) {
+              inducedAdj[iBase + ld++] = li - 1;
+            }
+          }
+        }
+        inducedDeg[i] = ld;
+      }
+
+      // Clear the localIdxMap slots we wrote (must not leak to next shape).
+      for (let i = 0; i < cn; i++) localIdxMap[shapeCorners[i]] = 0;
+
+      // Connected components in induced graph, via BFS on local indices.
+      visitVer++;
+      for (let seed = 0; seed < cn; seed++) {
+        if (visited[seed] === visitVer) continue;
+        // Collect component; track whether it contains lexMinLocal.
+        let sp = 0;
+        stack[sp++] = seed;
+        visited[seed] = visitVer;
+        const compStart = sp === 1 ? 0 : 0;
+        // Use a simple JS array for comp (rarely > 100 nodes, allocator OK).
+        const comp = [seed];
+        let hasLex = (seed === lexMinLocal);
+        while (sp) {
+          const n = stack[--sp];
+          const base = n * MAX_DEG, d = inducedDeg[n];
+          for (let k = 0; k < d; k++) {
+            const m = inducedAdj[base + k];
+            if (visited[m] !== visitVer) {
+              visited[m] = visitVer;
+              stack[sp++] = m;
+              comp.push(m);
+              if (m === lexMinLocal) hasLex = true;
+            }
+          }
+        }
+        if (comp.length < 3) continue;
+
+        // Dedup paths by sorted-corner-key signature. Build the signature
+        // and the key inline.
+        const compKeys = new Uint32Array(comp.length);
+        for (let i = 0; i < comp.length; i++) compKeys[i] = shapeCorners[comp[i]];
+        compKeys.sort();
+        let keyStr = '';
+        for (let i = 0; i < compKeys.length; i++) keyStr += compKeys[i] + ',';
+
+        let path = pathIndex.get(keyStr);
+        if (!path) {
+          const nodes = tracePathLocal(inducedAdj, inducedDeg, comp, shapeCorners, gw);
+          if (nodes.length < 3) continue;
+          path = new Path(nodes, gw);
+          pathIndex.set(keyStr, path);
+          this.paths.push(path);
+        }
+        if (hasLex) shape.outer = path; else shape.holes.push(path);
+        path.shapes.add(shape);
       }
     }
   }
+}
 
-  _makePath(graph, nodeSet) {
-    const nodes = [...nodeSet];
-    if (nodes.length < 3) return null;
-    const key = nodes.slice().sort().join(';');
-    if (this.paths.has(key)) return this.paths.get(key);
-    const path = new Path(graph, nodeSet);
-    this.paths.set(key, path);
-    return path;
+// Global scratch for corner-key → local-index mapping during _assignPaths.
+// Sized once to the grid capacity lazily; reset between shapes via clearing.
+let localIdxMap = new Int32Array(0);
+
+// ============================================================================
+// FixedGraph — dense fixed-slot adjacency for integer-keyed nodes with
+// bounded degree (≤ MAX_DEG). Zero-alloc for all ops. Replaces the former
+// Map<int, Set<int>> SparseGraph. Nodes are indexed in [0, capacity).
+//
+//   exists[n]              1 byte: 1 if node n is present
+//   adj[n * MAX_DEG + s]   4 bytes: neighbor key, or EMPTY = 0xFFFFFFFF
+//   deg[n]                 1 byte: current degree of n
+//
+// All three arrays are TypedArrays — memory-packed, cache-friendly.
+// ============================================================================
+const EMPTY   = 0xFFFFFFFF;
+const MAX_DEG = 8;               // max degree observed on the quarter-pixel grid
+
+class FixedGraph {
+  constructor(capacity) {
+    this.capacity = capacity;
+    this.exists = new Uint8Array(capacity);
+    this.deg    = new Uint8Array(capacity);
+    this.adj    = new Uint32Array(capacity * MAX_DEG);
+    this.adj.fill(EMPTY);
+  }
+  addNode(n)      { this.exists[n] = 1; }
+  hasNode(n)      { return this.exists[n] === 1; }
+  removeNode(n) {
+    if (!this.exists[n]) return;
+    const base = n * MAX_DEG, d = this.deg[n];
+    for (let i = 0; i < d; i++) {
+      const m = this.adj[base + i];
+      if (m === EMPTY) continue;
+      // Remove back-edge m → n
+      const mb = m * MAX_DEG, md = this.deg[m];
+      for (let j = 0; j < md; j++) if (this.adj[mb + j] === n) {
+        this.adj[mb + j] = this.adj[mb + md - 1];
+        this.adj[mb + md - 1] = EMPTY;
+        this.deg[m] = md - 1;
+        break;
+      }
+      this.adj[base + i] = EMPTY;
+    }
+    this.deg[n] = 0;
+    this.exists[n] = 0;
+  }
+  addEdge(a, b) {
+    this.exists[a] = 1; this.exists[b] = 1;
+    if (!this._hasNeighbor(a, b)) {
+      this.adj[a * MAX_DEG + this.deg[a]++] = b;
+      this.adj[b * MAX_DEG + this.deg[b]++] = a;
+    }
+  }
+  hasEdge(a, b) { return this.exists[a] === 1 && this._hasNeighbor(a, b); }
+  removeEdge(a, b) {
+    this._removeOne(a, b);
+    this._removeOne(b, a);
+  }
+  _hasNeighbor(n, m) {
+    const base = n * MAX_DEG, d = this.deg[n];
+    for (let i = 0; i < d; i++) if (this.adj[base + i] === m) return true;
+    return false;
+  }
+  _removeOne(n, m) {
+    const base = n * MAX_DEG, d = this.deg[n];
+    for (let i = 0; i < d; i++) if (this.adj[base + i] === m) {
+      this.adj[base + i] = this.adj[base + d - 1];
+      this.adj[base + d - 1] = EMPTY;
+      this.deg[n] = d - 1;
+      return;
+    }
+  }
+  degreeOf(n)   { return this.deg[n]; }
+  // Write neighbors of n into out[]; return count.
+  neighborsInto(n, out) {
+    const base = n * MAX_DEG, d = this.deg[n];
+    for (let i = 0; i < d; i++) out[i] = this.adj[base + i];
+    return d;
+  }
+  // Iterate with a callback — no allocation.
+  forEachNeighbor(n, fn) {
+    const base = n * MAX_DEG, d = this.deg[n];
+    for (let i = 0; i < d; i++) fn(this.adj[base + i]);
+  }
+  // Iterate all existing nodes into an out array; return count.
+  // Typically called once per pass in non-hot code.
+  *nodes() {
+    const e = this.exists;
+    for (let i = 0; i < this.capacity; i++) if (e[i]) yield i;
+  }
+  copy() {
+    const g = new FixedGraph(this.capacity);
+    g.exists.set(this.exists);
+    g.deg.set(this.deg);
+    g.adj.set(this.adj);
+    return g;
   }
 }
 
-// numeric comparison on "x,y" keys (parse once, compare tuple)
-function minKey(a, b) {
-  const [ax, ay] = parseKey(a), [bx, by] = parseKey(b);
-  if (ax !== bx) return ax < bx ? a : b;
-  return ay < by ? a : b;
+// ============================================================================
+// Planar-face trace (local-index variant for _assignPaths).
+// inducedAdj/Deg are stride-MAX_DEG arrays indexed by local node index
+// (0..cn-1). shapeCorners maps local index → corner key (needed for the
+// lex-min start selection and the final coordinate conversion).
+// Returns an array of corner keys (not local indices).
+// ============================================================================
+function tracePathLocal(inducedAdj, inducedDeg, comp, shapeCorners, gw) {
+  // Lex-min start among this component's LOCAL indices.
+  let startLocal = comp[0];
+  let startKey = shapeCorners[startLocal];
+  let startX = startKey % gw, startY = (startKey / gw) | 0;
+  for (let i = 1; i < comp.length; i++) {
+    const lc = comp[i];
+    const k = shapeCorners[lc];
+    const cx = k % gw, cy = (k / gw) | 0;
+    if (cx < startX || (cx === startX && cy < startY)) {
+      startLocal = lc; startKey = k; startX = cx; startY = cy;
+    }
+  }
+  const d0 = inducedDeg[startLocal];
+  if (d0 === 0) return [startKey];
+  const base0 = startLocal * MAX_DEG;
+  // Pick neighbor with smallest slope.
+  let firstLocal = inducedAdj[base0];
+  {
+    let firstKey = shapeCorners[firstLocal];
+    let bestSlope = slopeIntKeys(startX, startY, firstKey, gw);
+    for (let i = 1; i < d0; i++) {
+      const lc = inducedAdj[base0 + i];
+      const k = shapeCorners[lc];
+      const s = slopeIntKeys(startX, startY, k, gw);
+      if (s < bestSlope) { bestSlope = s; firstLocal = lc; firstKey = k; }
+    }
+  }
+  const out = [startKey];
+  let prev = startLocal, curr = firstLocal;
+  const maxSteps = comp.length * 4 + 10;
+  for (let step = 0; step < maxSteps; step++) {
+    out.push(shapeCorners[curr]);
+    const d = inducedDeg[curr];
+    if (d === 0) break;
+    const next = pickMostCWLocal(prev, curr, inducedAdj, d, shapeCorners, gw);
+    if (next === -1) break;
+    if (curr === startLocal && next === firstLocal) break;
+    prev = curr; curr = next;
+  }
+  if (out.length > 1 && out[out.length - 1] === startKey) out.pop();
+  return out;
+}
+function slopeIntKeys(x0, y0, nKey, gw) {
+  const x1 = nKey % gw, y1 = (nKey / gw) | 0;
+  const dx = x1 - x0, dy = y1 - y0;
+  return dx === 0 ? dy * 1e14 : dy / dx;
+}
+const PI2 = Math.PI * 2;
+function pickMostCWLocal(prevLocal, currLocal, inducedAdj, d, shapeCorners, gw) {
+  const currKey = shapeCorners[currLocal], prevKey = shapeCorners[prevLocal];
+  const cx = currKey % gw, cy = (currKey / gw) | 0;
+  const px = prevKey % gw, py = (prevKey / gw) | 0;
+  const inAng = Math.atan2(py - cy, px - cx);
+  const base = currLocal * MAX_DEG;
+  let bestLocal = -1, bestTurn = Infinity;
+  for (let k = 0; k < d; k++) {
+    const nLocal = inducedAdj[base + k];
+    if (nLocal === prevLocal && d > 1) continue;
+    const nKey = shapeCorners[nLocal];
+    const nx = nKey % gw, ny = (nKey / gw) | 0;
+    let turn = inAng - Math.atan2(ny - cy, nx - cx);
+    while (turn <    0) turn += PI2;
+    while (turn >= PI2) turn -= PI2;
+    if (turn < bestTurn) { bestTurn = turn; bestLocal = nLocal; }
+  }
+  if (bestLocal === -1 && d === 1) bestLocal = inducedAdj[base];
+  return bestLocal;
 }
 
-// ---------- Shape ------------------------------------------------------------
-class Shape {
-  constructor(pixels, color, corners) {
-    this.pixels  = pixels;
-    this.color   = color;
-    this.corners = corners;
-    this.outer   = null;
-    this.holes   = [];
-  }
-  addOutline(path, isOuter) {
-    if (isOuter) this.outer = path; else this.holes.push(path);
-    path.shapes.add(this);
-  }
-}
-
-// ---------- Path: cyclic ordered traversal of a boundary subgraph ------------
-// Uses angle-based next-edge selection to trace a topological face correctly
-// even through degree-3+ junctions (multiple pinch points inside a shape's
-// boundary), not just simple cycles.
+// ============================================================================
+// Path — boundary polyline + its quadratic B-spline fit.
+// ============================================================================
 class Path {
-  constructor(graph, nodeSet) {
-    this.graph  = graph;
-    this.nodes  = this._trace(nodeSet);
+  constructor(nodes, gw) {
+    this.n = nodes.length;
+    const p = this.pts = new Float32Array(this.n * 2);
+    for (let i = 0; i < this.n; i++) {
+      const k = nodes[i];
+      p[i*2]     = (k % gw) / Q4;
+      p[i*2 + 1] = ((k / gw) | 0) / Q4;
+    }
     this.shapes = new Set();
     this.spline = null;
     this.smooth = null;
   }
-
-  // Planar face-walking traversal. At every vertex we arrive along a
-  // directed edge (prev→curr); to stay on the same face we pick the
-  // next outgoing edge that is the MOST CLOCKWISE turn from the reverse
-  // of our incoming direction. This gives the canonical "walk along the
-  // wall with your right hand touching it" polygon trace.
-  _trace(nodeSet) {
-    // Pick the lex-min node as start. That node lies on the OUTER hull of
-    // the component (smallest x, then smallest y among all corners), so the
-    // face we trace starting there is the outer face of that component.
-    let start = null;
-    for (const n of nodeSet) if (start === null || minKey(n, start) === n) start = n;
-    const nbsStart = [...this.graph.neighbors(start)].filter(n => nodeSet.has(n));
-    if (nbsStart.length === 0) return [start];
-    // From the lex-min corner go to the neighbor with smallest slope.
-    // Since lex-min is on the outer hull, all neighbors are to the right
-    // or below, so sorting by slope picks a canonical outgoing direction.
-    const [sx, sy] = parseKey(start);
-    nbsStart.sort((a, b) => this._slope(sx, sy, a) - this._slope(sx, sy, b));
-
-    const path = [start];
-    let prev = start, curr = nbsStart[0];
-    // Walk until we return to the starting edge (start → nbsStart[0]).
-    // Guard with a hard iteration cap as a safety net.
-    const maxSteps = nodeSet.size * 4 + 10;
-    let steps = 0;
-    while (steps++ < maxSteps) {
-      path.push(curr);
-      const nb = [...this.graph.neighbors(curr)].filter(n => nodeSet.has(n));
-      if (nb.length === 0) break;
-      const next = this._nextCW(prev, curr, nb);
-      if (next === null) break;
-      // Termination: we've closed the loop when the oriented edge
-      // (curr → next) equals the oriented edge we started with
-      // (start → nbsStart[0]).
-      if (curr === start && next === nbsStart[0]) break;
-      prev = curr; curr = next;
-    }
-    // Drop duplicate trailing start if present (we re-visit 'start' then
-    // detect termination).
-    if (path.length > 1 && path[path.length - 1] === start) path.pop();
-    return path;
-  }
-
-  // Given that we arrived at `curr` from `prev`, pick the next neighbor
-  // (from `nbs`) that is the most-clockwise turn from the incoming edge.
-  // Angles measured counter-clockwise from +x; we take the neighbor whose
-  // angle, measured relative to the incoming reverse direction, is the
-  // smallest positive rotation — i.e. the tightest clockwise turn.
-  _nextCW(prev, curr, nbs) {
-    const [cx, cy] = parseKey(curr);
-    const [px, py] = parseKey(prev);
-    // Incoming-reverse direction: from curr back toward prev.
-    const inAng = Math.atan2(py - cy, px - cx);
-    let best = null, bestTurn = Infinity;
-    for (const n of nbs) {
-      if (n === prev && nbs.length > 1) continue;   // don't U-turn if any alternative exists
-      const [nx, ny] = parseKey(n);
-      const outAng = Math.atan2(ny - cy, nx - cx);
-      // CW turn magnitude from inAng to outAng, in [0, 2π).
-      let turn = inAng - outAng;
-      while (turn <    0) turn += 2 * Math.PI;
-      while (turn >= 2 * Math.PI) turn -= 2 * Math.PI;
-      if (turn < bestTurn) { bestTurn = turn; best = n; }
-    }
-    // If nbs.length === 1, only option is the U-turn — take it.
-    if (best === null && nbs.length === 1) best = nbs[0];
-    return best;
-  }
-
-  _slope(x0, y0, n) {
-    const [x1, y1] = parseKey(n);
-    const dx = x1 - x0, dy = y1 - y0;
-    return dx === 0 ? dy * 1e14 : dy / dx;
-  }
-  makeSpline() {
-    const pts = this.nodes.map(parseKey);
-    if (pts.length < 3) { this.spline = null; return; }
-    this.spline = ClosedBSpline.fit(pts, 2);
+  fitSpline() {
+    if (this.n < 3) return;
+    this.spline = ClosedBSpline.fit(this.pts, this.n, 2);
   }
 }
 
-// ---------- Quadratic closed B-spline ----------------------------------------
-// Control points are plain Float64Array pairs packed [x0,y0,x1,y1,...].
-// Closed form: the first `degree` points are duplicated at the end (wrap).
+// ============================================================================
+// Closed quadratic B-spline (Float64Array-backed).
+// ============================================================================
 class ClosedBSpline {
-  constructor(knots, cps, degree = 2) {
-    this.knots  = knots;                 // Float64Array
-    this.cps    = cps;                   // Float64Array of length 2*n
-    this.degree = degree;
-    this.n      = cps.length / 2;
-    this.unwrappedLen = this.n - degree; // # of "useful" (non-wrapped) control points
+  constructor(knots, cps, degree, unwrap) {
+    this.knots = knots; this.cps = cps; this.degree = degree;
+    this.n = cps.length / 2; this.unwrap = unwrap;
+    this._d1 = null;
   }
-  static fit(points, degree = 2) {
-    // Wrap: append first `degree` points to end so spline is closed.
-    const all = points.concat(points.slice(0, degree));
-    const n = all.length, m = n + degree;
+  static fit(pts, nPts, degree) {
+    const n = nPts + degree, m = n + degree;
     const knots = new Float64Array(m + 1);
     for (let i = 0; i <= m; i++) knots[i] = i / m;
-    const cps = new Float64Array(2 * n);
-    for (let i = 0; i < n; i++) { cps[2*i] = all[i][0]; cps[2*i + 1] = all[i][1]; }
-    return new ClosedBSpline(knots, cps, degree);
-  }
-  copy() { return new ClosedBSpline(new Float64Array(this.knots), new Float64Array(this.cps), this.degree); }
-  domain() { return [this.knots[this.degree], this.knots[this.n]]; }
-  cpGet(i) { return [this.cps[2*i], this.cps[2*i + 1]]; }
-  cpSet(i, x, y) {
-    i = ((i % this.unwrappedLen) + this.unwrappedLen) % this.unwrappedLen;
-    this.cps[2*i] = x; this.cps[2*i + 1] = y;
-    if (i < this.degree) {
-      const j = i + this.unwrappedLen;
-      this.cps[2*j] = x; this.cps[2*j + 1] = y;
+    const cps = new Float64Array(n * 2);
+    for (let i = 0; i < nPts; i++) { cps[i*2] = pts[i*2]; cps[i*2+1] = pts[i*2+1]; }
+    for (let i = 0; i < degree; i++) {
+      cps[(nPts + i)*2]     = pts[i*2];
+      cps[(nPts + i)*2 + 1] = pts[i*2 + 1];
     }
+    return new ClosedBSpline(knots, cps, degree, nPts);
   }
-  // de Boor's algorithm evaluated at u.
-  eval(u) {
-    const p = this.degree, k = this._span(u);
-    // copy p+1 relevant control points
-    const d = new Float64Array(2 * (p + 1));
+  copy() {
+    return new ClosedBSpline(
+      new Float64Array(this.knots),
+      new Float64Array(this.cps),
+      this.degree, this.unwrap);
+  }
+  cpSet(i, x, y) {
+    i = ((i % this.unwrap) + this.unwrap) % this.unwrap;
+    this.cps[i*2] = x; this.cps[i*2+1] = y;
+    if (i < this.degree) {
+      const j = i + this.unwrap;
+      this.cps[j*2] = x; this.cps[j*2+1] = y;
+    }
+    this._d1 = null;
+  }
+  // de Boor — writes into result[0..1]
+  evalAt(u, result) {
+    const p = this.degree, knots = this.knots, cps = this.cps;
+    let k;
+    if (u <= knots[p]) k = p;
+    else if (u >= knots[this.n]) k = this.n - 1;
+    else {
+      let lo = p, hi = this.n;
+      while (lo < hi - 1) { const mid = (lo + hi) >> 1; (u < knots[mid]) ? hi = mid : lo = mid; }
+      k = lo;
+    }
+    // inlined small allocations: for p<=2 we only need 3 points
+    const i0 = 2 * (k - p), i1 = i0 + 2, i2 = i0 + 4;
+    let dx0 = cps[i0], dy0 = cps[i0+1];
+    let dx1 = cps[i1], dy1 = cps[i1+1];
+    let dx2 = p >= 2 ? cps[i2]   : 0;
+    let dy2 = p >= 2 ? cps[i2+1] : 0;
+    if (p === 2) {
+      // r=1: update (1), (2)
+      let a = (u - knots[k - 1]) / (knots[k + 1] - knots[k - 1]);
+      dx1 = (1 - a) * dx0 + a * dx1; dy1 = (1 - a) * dy0 + a * dy1;
+      a   = (u - knots[k    ]) / (knots[k + 2] - knots[k    ]);
+      dx2 = (1 - a) * cps[i1] /* old */ + a * dx2; dy2 = (1 - a) * cps[i1+1] + a * dy2;
+      // r=2: final
+      a   = (u - knots[k    ]) / (knots[k + 1] - knots[k    ]);
+      result[0] = (1 - a) * dx1 + a * dx2;
+      result[1] = (1 - a) * dy1 + a * dy2;
+      return;
+    } else if (p === 1) {
+      const a = (u - knots[k]) / (knots[k + 1] - knots[k]);
+      result[0] = (1 - a) * dx0 + a * dx1;
+      result[1] = (1 - a) * dy0 + a * dy1;
+      return;
+    } else if (p === 0) {
+      result[0] = dx0; result[1] = dy0; return;
+    }
+    // Generic path (not hit for our use).
+    const dX = new Float64Array(p + 1), dY = new Float64Array(p + 1);
     for (let i = 0; i <= p; i++) {
-      d[2*i]     = this.cps[2 * (k - p + i)];
-      d[2*i + 1] = this.cps[2 * (k - p + i) + 1];
+      dX[i] = cps[2*(k - p + i)]; dY[i] = cps[2*(k - p + i) + 1];
     }
     for (let r = 1; r <= p; r++) for (let i = p; i >= r; i--) {
       const j = k - p + i;
-      const a = (u - this.knots[j]) / (this.knots[j + p - r + 1] - this.knots[j]);
-      d[2*i]     = (1 - a) * d[2*(i-1)]     + a * d[2*i];
-      d[2*i + 1] = (1 - a) * d[2*(i-1) + 1] + a * d[2*i + 1];
+      const a = (u - knots[j]) / (knots[j + p - r + 1] - knots[j]);
+      dX[i] = (1 - a) * dX[i-1] + a * dX[i];
+      dY[i] = (1 - a) * dY[i-1] + a * dY[i];
     }
-    return [d[2*p], d[2*p + 1]];
+    result[0] = dX[p]; result[1] = dY[p];
   }
-  _span(u) {
-    // Locate the knot span index k with knots[k] <= u < knots[k+1], clamped to domain.
-    const p = this.degree, n = this.n;
-    if (u >= this.knots[n]) return n - 1;
-    if (u <= this.knots[p]) return p;
-    let lo = p, hi = n;
-    while (lo < hi - 1) { const mid = (lo + hi) >> 1; (u < this.knots[mid]) ? hi = mid : lo = mid; }
-    return lo;
-  }
-  // Decompose into successive quadratic Beziers, one per interior knot span.
-  // Mirrors Python Quadratic_Bezier_Fit: interior knots are knots[degree..n],
-  // interior control points are cps[1..n-degree].
-  *toBeziers() {
-    const p = this.degree;
-    let prev = this.eval(this.knots[p]);
-    for (let k = 0; k < this.n - p; k++) {
-      const ctrl = this.cpGet(k + 1);
-      const end  = this.eval(this.knots[p + 1 + k]);
-      yield [prev, ctrl, end];
-      prev = end;
-    }
-  }
-  // First-derivative spline (degree p-1).
   derivative() {
-    if (this._d) return this._d;
+    if (this._d1) return this._d1;
     const p = this.degree, n = this.n;
-    const newCps = new Float64Array(2 * (n - 1));
+    const nc = new Float64Array((n - 1) * 2);
     for (let i = 0; i < n - 1; i++) {
       const c = p / (this.knots[i + 1 + p] - this.knots[i + 1]);
-      newCps[2*i]     = c * (this.cps[2*(i+1)]     - this.cps[2*i]);
-      newCps[2*i + 1] = c * (this.cps[2*(i+1) + 1] - this.cps[2*i + 1]);
+      nc[i*2]     = c * (this.cps[(i+1)*2]     - this.cps[i*2]);
+      nc[i*2 + 1] = c * (this.cps[(i+1)*2 + 1] - this.cps[i*2 + 1]);
     }
-    const newKnots = this.knots.slice(1, this.knots.length - 1);
-    this._d = new ClosedBSpline(newKnots, newCps, p - 1);
-    return this._d;
+    const nk = this.knots.slice(1, this.knots.length - 1);
+    this._d1 = new ClosedBSpline(nk, nc, p - 1, this.unwrap);
+    return this._d1;
   }
-  _clearDerivCache() { this._d = null; this._dd = null; }
-  curvature(u) {
-    const d1s = this.derivative();
-    const d2s = (this._dd ||= d1s.derivative());
-    const [x1, y1] = d1s.eval(u), [x2, y2] = d2s.eval(u);
-    const num = x1 * y2 - y1 * x2, den = Math.pow(x1*x1 + y1*y1, 1.5);
-    return den === 0 ? 0 : Math.abs(num / den);
+  // Write beziers into out[] as flat 6-tuples (sx,sy,cx,cy,ex,ey). Returns count.
+  toBeziers(out) {
+    const p = this.degree;
+    const tmp = TMP2;
+    this.evalAt(this.knots[p], tmp);
+    let sx = tmp[0], sy = tmp[1];
+    const count = this.n - p;
+    for (let k = 0; k < count; k++) {
+      const cx = this.cps[(k + 1) * 2];
+      const cy = this.cps[(k + 1) * 2 + 1];
+      this.evalAt(this.knots[p + 1 + k], tmp);
+      const ex = tmp[0], ey = tmp[1];
+      const base = k * 6;
+      out[base  ] = sx; out[base+1] = sy;
+      out[base+2] = cx; out[base+3] = cy;
+      out[base+4] = ex; out[base+5] = ey;
+      sx = ex; sy = ey;
+    }
+    return count;
   }
-  // Reverse curve direction (for SVG winding when drawing outer + holes).
   reversed() {
     const p = this.degree, n = this.n;
-    const newKnots = new Float64Array(this.knots.length);
-    for (let i = 0; i < this.knots.length; i++) newKnots[i] = 1 - this.knots[this.knots.length - 1 - i];
-    const newCps = new Float64Array(this.cps.length);
+    const nk = new Float64Array(this.knots.length);
+    for (let i = 0; i < nk.length; i++) nk[i] = 1 - this.knots[nk.length - 1 - i];
+    const nc = new Float64Array(this.cps.length);
     for (let i = 0; i < n; i++) {
-      newCps[2*i]     = this.cps[2*(n - 1 - i)];
-      newCps[2*i + 1] = this.cps[2*(n - 1 - i) + 1];
+      nc[i*2]     = this.cps[(n - 1 - i) * 2];
+      nc[i*2 + 1] = this.cps[(n - 1 - i) * 2 + 1];
     }
-    return new ClosedBSpline(newKnots, newCps, p);
+    return new ClosedBSpline(nk, nc, p, this.unwrap);
   }
 }
+const TMP2 = new Float64Array(2);
 
-// ---------- Spline smoother (random-relaxation over energy) ------------------
-class SplineSmoother {
-  static INTERVALS_PER_SPAN = 20;
-  static GUESSES            = 20;
-  static OFFSET             = 0.05;
-  static ITERATIONS         = 20;
-  static POS_MULT           = 1;
+// ============================================================================
+// Spline smoother — random-relaxation. Hot loop operates on Float64Arrays
+// directly with zero per-iteration allocation.
+// ============================================================================
+function smoothSpline(original, opts) {
+  const iterations  = opts.iterations   ?? 20;
+  const guesses     = opts.guesses      ?? 20;
+  const guessOffset = opts.guessOffset  ?? 0.05;
+  const N_INT = 20;
 
-  constructor(spline, opts = {}) {
-    this.orig   = spline;                                 // reference for E_p
-    this.s      = spline.copy();
-    this.iters  = opts.iterations   ?? SplineSmoother.ITERATIONS;
-    this.guesses= opts.guesses      ?? SplineSmoother.GUESSES;
-    this.offset = opts.guessOffset  ?? SplineSmoother.OFFSET;
+  const s = original.copy();
+  const U = s.unwrap, p = s.degree, knots = s.knots;
+  const d1 = new Float64Array(2), d2 = new Float64Array(2);
+  const domLo = knots[p], domHi = knots[s.n];
+
+  function curvature(u) {
+    const D1 = s.derivative();
+    const D2 = D1.derivative();
+    D1.evalAt(u, d1); D2.evalAt(u, d2);
+    const x1 = d1[0], y1 = d1[1], x2 = d2[0], y2 = d2[1];
+    const num = x1 * y2 - y1 * x2;
+    const q = x1 * x1 + y1 * y1;
+    const den = q * Math.sqrt(q);
+    return den === 0 ? 0 : Math.abs(num / den);
   }
-  smooth() {
-    const U = this.s.unwrappedLen;
-    for (let it = 0; it < this.iters; it++) {
-      for (let i = 0; i < U; i++) {
-        const [sx, sy] = this.s.cpGet(i);
-        let bestE = this._E(i), bx = sx, by = sy;
-        for (let k = 0; k < this.guesses; k++) {
-          const r  = Math.random() * this.offset;
-          const th = Math.random() * Math.PI * 2;
-          const cx = sx + r * Math.cos(th), cy = sy + r * Math.sin(th);
-          this.s.cpSet(i, cx, cy); this.s._clearDerivCache();
-          const e = this._E(i);
-          if (e < bestE) { bestE = e; bx = cx; by = cy; }
-        }
-        this.s.cpSet(i, bx, by); this.s._clearDerivCache();
+
+  function energyAt(i) {
+    const ox = original.cps[i*2], oy = original.cps[i*2 + 1];
+    const cx = s.cps[i*2],        cy = s.cps[i*2 + 1];
+    const dx = cx - ox, dy = cy - oy;
+    const dsq = dx * dx + dy * dy;
+    let E = dsq * dsq;
+    for (let r = 0; r < p; r++) {
+      let lo = knots[i + 1 + r], hi = knots[i + 2 + r];
+      if (lo < domLo) lo = domLo; else if (lo > domHi) lo = domHi;
+      if (hi < domLo) hi = domLo; else if (hi > domHi) hi = domHi;
+      if (lo === hi) continue;
+      const step = (hi - lo) / N_INT;
+      let acc = 0.5 * (curvature(lo) + curvature(hi));
+      for (let j = 1; j < N_INT; j++) acc += curvature(lo + j * step);
+      E += acc * step;
+    }
+    return E;
+  }
+
+  for (let it = 0; it < iterations; it++) {
+    for (let i = 0; i < U; i++) {
+      const sx = s.cps[i*2], sy = s.cps[i*2 + 1];
+      let bestE = energyAt(i), bx = sx, by = sy;
+      for (let k = 0; k < guesses; k++) {
+        const r = Math.random() * guessOffset;
+        const th = Math.random() * PI2;
+        const cx = sx + r * Math.cos(th), cy = sy + r * Math.sin(th);
+        s.cpSet(i, cx, cy);
+        const e = energyAt(i);
+        if (e < bestE) { bestE = e; bx = cx; by = cy; }
+      }
+      s.cpSet(i, bx, by);
+    }
+  }
+  return s;
+}
+
+// ============================================================================
+// SVG writer. Assembles one big string from pre-stringified tokens and
+// lookup tables. No per-pixel number-to-string coercion in the hot path.
+// ============================================================================
+class SVGWriter {
+  constructor(pd, scale) {
+    this.pd = pd; this.scale = scale;
+    // Pre-render strings for all quarter-pixel-aligned coordinates.
+    // After deformation every corner is a multiple of Q4; after smoothing
+    // they drift slightly but still often land near quarter-pixels, so
+    // this table hits often and saves toString() cost.
+    const maxQ = Math.max(pd.w, pd.h) * Q4 + Q4;
+    this.qStr = new Array(maxQ + 1);
+    const S = scale;
+    for (let i = 0; i <= maxQ; i++) {
+      const v = (i / Q4) * S;
+      this.qStr[i] = Number.isInteger(v) ? v.toString() : v.toFixed(1);
+    }
+    // Pre-render RGB strings per unique color.
+    this.colorStr = new Map();
+    for (let i = 0; i < pd.rgb.length; i++) {
+      const c = pd.rgb[i];
+      if (!this.colorStr.has(c)) {
+        this.colorStr.set(c,
+          'rgb(' + ((c >> 16) & 255) + ',' + ((c >> 8) & 255) + ',' + (c & 255) + ')');
       }
     }
-    return this.s;
+    // Pre-rendered "scale" string used by the NN backdrop.
+    this.scaleStr = String(S);
   }
-  _E(i) { return this._Ec(i) + this._Ep(i); }
-  _Ep(i) {
-    const [ox, oy] = this.orig.cpGet(i), [x, y] = this.s.cpGet(i);
-    const d = Math.hypot(x - ox, y - oy);
-    return d * d * d * d * SplineSmoother.POS_MULT;
-  }
-  // Integrated |curvature| over knot spans influenced by control point i.
-  _Ec(i) {
-    const p = this.s.degree, k = this.s.knots;
-    let sum = 0;
-    // Control point i influences knot spans [k[i+1]..k[i+p+1]], clamped to domain.
-    const [d0, d1] = this.s.domain();
-    for (let r = 0; r < p; r++) {
-      const lo = Math.max(d0, Math.min(d1, k[i + 1 + r]));
-      const hi = Math.max(d0, Math.min(d1, k[i + 2 + r]));
-      if (lo === hi) continue;
-      const N = SplineSmoother.INTERVALS_PER_SPAN;
-      const step = (hi - lo) / N;
-      let acc = 0.5 * (this.s.curvature(lo) + this.s.curvature(hi));
-      for (let j = 1; j < N; j++) acc += this.s.curvature(lo + j * step);
-      sum += acc * step;
+  _col(c) { return this.colorStr.get(c); }
+  _num(v) {
+    // Hot path: quarter-pixel-aligned values hit the lookup table.
+    const q = v * Q4;
+    const qi = (q + 0.5) | 0;
+    if (Math.abs(q - qi) < 1e-4 && qi >= 0 && qi < this.qStr.length) {
+      return this.qStr[qi];
     }
-    return sum;
-  }
-}
-
-// ---------- SVG writer -------------------------------------------------------
-// Two render modes — both are correct implementations of parts of the paper.
-//
-// "shape" mode  (the classic pipeline — good for hand-drawn pixel art with a
-//               small palette, like Yoshi, Invaders, Mario):
-//   Emit one filled region per connected same-color component, with outer and
-//   inner boundaries smoothed by quadratic B-splines (§3.3–3.4).
-//
-// "cell" mode   (the correct fallback for photographic / anti-aliased input):
-//   Emit one polygon per pixel cell using that pixel's own color. This is the
-//   rendering primitive the paper describes in §3.5: "place color diffusion
-//   sources at the centroids of the cells". Photo-like input keeps every
-//   unique tint instead of collapsing to a handful of flat blobs.
-//
-// The default is "auto": if the input contains more than 32 distinct colors
-// we pick "cell"; otherwise "shape". This recovers classic behaviour for
-// small sprites and fixes the Figure-11 failure case for photo input.
-class SVGWriter {
-  constructor(pd, scale = 40) { this.pd = pd; this.scale = scale; }
-
-  _colorStr(c) {
-    return 'rgb(' + ((c >> 16) & 255) + ',' + ((c >> 8) & 255) + ',' + (c & 255) + ')';
-  }
-  _pt(xy) {
-    // Drop trailing ".0" to keep output compact. Fractional quarter-pixel
-    // corners are preserved as needed.
-    const fmt = v => {
-      const s = (v * this.scale).toFixed(1);
-      return s.endsWith('.0') ? s.slice(0, -2) : s;
-    };
-    return [fmt(xy[0]), fmt(xy[1])];
+    const scaled = v * this.scale;
+    const rounded = Math.round(scaled * 10) / 10;
+    return rounded.toString();
   }
 
-  render(opts = {}) {
-    const { w, h } = this.pd;
-    const W = w * this.scale, H = h * this.scale;
-    const mode = opts.mode || this._autoMode();
-    const out = [
-      '<svg xmlns="http://www.w3.org/2000/svg" width="', W, '" height="', H,
-      '" viewBox="0 0 ', W, ' ', H, '" shape-rendering="geometricPrecision">',
-    ];
-    if (mode === 'cell') this._renderCells(out);
-    else                 this._renderShapes(out);
+  render() {
+    const pd = this.pd, S = this.scale;
+    const W = pd.w * S, H = pd.h * S;
+    const out = [];
+    out.push('<svg xmlns="http://www.w3.org/2000/svg" width="', W, '" height="', H,
+             '" viewBox="0 0 ', W, ' ', H, '" shape-rendering="geometricPrecision">');
+
+    // 1) Nearest-neighbor backdrop (every pixel as a square).
+    this._emitBackdrop(out);
+
+    // 2) Clipped smoothed silhouettes over big shapes.
+    this._emitShapes(out);
+
     out.push('</svg>');
     return out.join('');
   }
 
-  // Heuristic: count distinct colors. Classic pixel art rarely exceeds ~16
-  // colors; AI-generated or downsampled inputs easily have 1000+.
-  _autoMode() {
-    const seen = new Set(); const max = 64;
-    for (let i = 0; i < this.pd.pg.rgb.length; i += 3) {
-      seen.add((this.pd.pg.rgb[i] << 16) | (this.pd.pg.rgb[i+1] << 8) | this.pd.pg.rgb[i+2]);
-      if (seen.size > max) return 'cell';
-    }
-    return 'shape';
-  }
-
-  // ---- per-shape mode ------------------------------------------------------
-  _renderShapes(out) {
-    // Sort large-first so interior shapes layer on top.
-    const shapes = [...this.pd.shapes].sort((a, b) => b.pixels.length - a.pixels.length);
-    for (const shape of shapes) {
-      if (!shape.outer || !shape.outer.smooth) continue;
-      const splines = [shape.outer.smooth.reversed(),
-                       ...shape.holes.filter(p => p.smooth).map(p => p.smooth)];
-      const d = this._splinesPath(splines);
-      if (!d) continue;
-      const col = this._colorStr(shape.color);
-      out.push('<path fill="', col, '" stroke="', col,
-               '" stroke-width="0.5" fill-rule="evenodd" d="', d, '"/>');
-    }
-  }
-  _splinesPath(splines) {
-    const parts = [];
-    for (const spline of splines) {
-      const beziers = [...spline.toBeziers()];
-      if (!beziers.length) continue;
-      const [sx, sy] = this._pt(beziers[0][0]);
-      parts.push('M', sx, ',', sy);
-      for (const [, ctrl, end] of beziers) {
-        const [cx, cy] = this._pt(ctrl), [ex, ey] = this._pt(end);
-        parts.push('Q', cx, ',', cy, ' ', ex, ',', ey);
+  _emitBackdrop(out) {
+    const pd = this.pd, S = this.scale, sStr = this.scaleStr;
+    const xS = new Array(pd.w + 1);    // pre-stringified pixel x positions
+    const yS = new Array(pd.h + 1);
+    for (let x = 0; x <= pd.w; x++) xS[x] = (x * S).toString();
+    for (let y = 0; y <= pd.h; y++) yS[y] = (y * S).toString();
+    const rgb = pd.rgb;
+    // Row-merging: contiguous same-color pixels become one rect. Shrinks
+    // output size a lot on classic pixel art and photos with large flats.
+    for (let y = 0; y < pd.h; y++) {
+      let x = 0;
+      while (x < pd.w) {
+        const c = rgb[y * pd.w + x];
+        let x2 = x + 1;
+        while (x2 < pd.w && rgb[y * pd.w + x2] === c) x2++;
+        const ww = (x2 - x) * S;
+        out.push('<rect x="', xS[x], '" y="', yS[y],
+                 '" width="', ww, '" height="', sStr,
+                 '" fill="', this._col(c), '" shape-rendering="crispEdges"/>');
+        x = x2;
       }
-      parts.push('Z');
     }
-    return parts.join('');
   }
 
-  // ---- per-cell mode -------------------------------------------------------
-  // Two-layer approach that preserves per-pixel color (gradients, anti-
-  // aliasing) WHILE giving smoothly curved region silhouettes:
-  //   1. For each connected same-color shape, define a <clipPath> from its
-  //      smoothed outer spline boundary (and hole boundaries).
-  //   2. Render every pixel cell inside that clip with its own color.
-  // The clip absorbs the cell-polygon jaggies at the region boundary; the
-  // interior keeps every per-pixel tint.
-  _renderCells(out) {
-    const MIN_SMOOTH_PIXELS = 4;    // below this, skip spline silhouette
-    // Background pass: paint every pixel as a scale×scale square first.
-    // This guarantees full coverage with no sub-pixel gaps; subsequent
-    // clipped layers will overdraw with smooth silhouettes where valuable.
-    const S = this.scale;
-    for (let y = 0; y < this.pd.h; y++) for (let x = 0; x < this.pd.w; x++) {
-      const color = this._colorStr(this.pd.pg.rgbAt(x, y));
-      out.push('<rect x="', x*S, '" y="', y*S, '" width="', S, '" height="', S,
-               '" fill="', color, '" shape-rendering="crispEdges"/>');
-    }
-    // Clipped per-shape cells for silhouette smoothing.
-    const shapes = [...this.pd.shapes].sort((a, b) => b.pixels.length - a.pixels.length);
+  _emitShapes(out) {
+    const MIN_SMOOTH_PIXELS = 4;
+    const pd = this.pd;
+    const shapes = pd.shapes.slice().sort((a, b) => b.pixels.length - a.pixels.length);
+    let bezBuf = new Float32Array(256 * 6);
+
+    // Build clip-path definitions for shapes large enough to benefit.
     out.push('<defs>');
     const shapeId = new Map();
     for (let i = 0; i < shapes.length; i++) {
       const s = shapes[i];
       if (!s.outer || !s.outer.smooth || s.pixels.length < MIN_SMOOTH_PIXELS) continue;
-      const id = 'c' + i; shapeId.set(s, id);
-      const splines = [s.outer.smooth.reversed(),
-                       ...s.holes.filter(p => p.smooth).map(p => p.smooth)];
-      const d = this._splinesPath(splines);
-      out.push('<clipPath id="', id, '" clip-rule="evenodd"><path d="', d, '"/></clipPath>');
+      const id = 'c' + i;
+      shapeId.set(s, id);
+      const splines = [s.outer.smooth.reversed()];
+      for (const h of s.holes) if (h.smooth) splines.push(h.smooth);
+      out.push('<clipPath id="', id, '" clip-rule="evenodd"><path d="');
+      bezBuf = this._appendSplines(out, splines, bezBuf);
+      out.push('"/></clipPath>');
     }
     out.push('</defs>');
+
+    // Emit each big shape: backdrop (avg color) + per-cell overlays.
     for (const s of shapes) {
       const id = shapeId.get(s);
-      if (!id) continue;   // tiny shape — nearest-neighbor pass already covered it
-      const [avgR, avgG, avgB] = this._avgColor(s);
-      const avg = 'rgb(' + avgR + ',' + avgG + ',' + avgB + ')';
-      const splines = [s.outer.smooth.reversed(),
-                       ...s.holes.filter(p => p.smooth).map(p => p.smooth)];
-      const bgD = this._splinesPath(splines);
-      // Paint the shape's avg color as silhouette backdrop, then overlay
-      // per-pixel cells inside the clipPath. Cells use a wider stroke to
-      // bleed across seams; the clipPath hides overflow at the boundary.
-      out.push('<g clip-path="url(#', id, ')">',
-               '<path fill="', avg, '" fill-rule="evenodd" d="', bgD, '"/>');
-      for (const pix of s.pixels) {
-        const [x, y] = parseKey(pix);
-        const poly = this._cellPolygon(x, y);
-        if (!poly || poly.length < 3) continue;
-        const color = this._colorStr(this.pd.pg.rgbAt(x, y));
-        out.push('<path fill="', color, '" stroke="', color,
-                 '" stroke-width="1.5" stroke-linejoin="round" d="',
-                 this._polyPath(poly), '"/>');
+      if (!id) continue;
+      // Average color.
+      let ar = 0, ag = 0, ab = 0;
+      const rgb = pd.rgb;
+      for (let k = 0; k < s.pixels.length; k++) {
+        const c = rgb[s.pixels[k]];
+        ar += (c >> 16) & 255; ag += (c >> 8) & 255; ab += c & 255;
+      }
+      const n = s.pixels.length;
+      const avg = 'rgb(' + ((ar/n) | 0) + ',' + ((ag/n) | 0) + ',' + ((ab/n) | 0) + ')';
+      const splines = [s.outer.smooth.reversed()];
+      for (const h of s.holes) if (h.smooth) splines.push(h.smooth);
+      out.push('<g clip-path="url(#', id, ')"><path fill="', avg, '" fill-rule="evenodd" d="');
+      bezBuf = this._appendSplines(out, splines, bezBuf);
+      out.push('"/>');
+      // Per-cell overlays.
+      for (let k = 0; k < s.pixels.length; k++) {
+        const pi = s.pixels[k];
+        const col = this._col(rgb[pi]);
+        out.push('<path fill="', col, '" stroke="', col,
+                 '" stroke-width="1.5" stroke-linejoin="round" d="');
+        this._appendCellPolygon(out, pi);
+        out.push('"/>');
       }
       out.push('</g>');
     }
   }
-  _avgColor(shape) {
-    let r = 0, g = 0, b = 0;
-    for (const pix of shape.pixels) {
-      const c = this.pd.pg.rgbAt(...parseKey(pix));
-      r += (c >> 16) & 255; g += (c >> 8) & 255; b += c & 255;
-    }
-    const n = shape.pixels.length;
-    return [Math.round(r/n), Math.round(g/n), Math.round(b/n)];
-  }
-  _renderCellsPlain(out) {
-    for (let y = 0; y < this.pd.h; y++) for (let x = 0; x < this.pd.w; x++) {
-      const poly = this._cellPolygon(x, y);
-      if (!poly || poly.length < 3) continue;
-      const color = this._colorStr(this.pd.pg.rgbAt(x, y));
-      out.push('<path fill="', color, '" stroke="', color,
-               '" stroke-width="0.5" stroke-linejoin="round" d="',
-               this._polyPath(poly), '"/>');
-    }
-  }
-  _cellPolygon(x, y) {
-    const cornerSet = this.pd.corners.get(key2(x, y));
-    if (!cornerSet || cornerSet.size < 3) return null;
-    const verts = [...cornerSet].map(parseKey);
-    // Angular sort around centroid: each cell is convex after valence-2
-    // collapse, so this reliably recovers polygon order.
-    let cx = 0, cy = 0;
-    for (const [vx, vy] of verts) { cx += vx; cy += vy; }
-    cx /= verts.length; cy /= verts.length;
-    verts.sort((a, b) => Math.atan2(a[1] - cy, a[0] - cx) - Math.atan2(b[1] - cy, b[0] - cx));
-    return verts;
-  }
-  _polyPath(verts) {
-    const [x0, y0] = this._pt(verts[0]);
-    const parts = ['M', x0, ',', y0];
-    for (let i = 1; i < verts.length; i++) {
-      const [x, y] = this._pt(verts[i]);
-      parts.push('L', x, ',', y);
-    }
-    parts.push('Z');
-    return parts.join('');
-  }
-}
 
-// ---------- Public entry point -----------------------------------------------
-function depixelize(image, opts = {}) {
-  const { scale = 40, smooth = true } = opts;
-  const w = image.width, h = image.height;
-  const rgba = image.data;
-  const pd = new PixelData(w, h, rgba);
-  pd.run();
-  const writer = new SVGWriter(pd, scale);
-  const mode = opts.mode || writer._autoMode();
-  // Fit splines whenever we'll use them: "shape" mode draws them directly,
-  // "cell" mode uses them as clip boundaries to round cell-polygon edges.
-  // Only skip if the caller explicitly asked for smooth=false.
-  if (smooth !== false) {
-    for (const path of pd.paths.values()) path.makeSpline();
-    for (const path of pd.paths.values()) {
-      if (!path.spline) continue;
-      if (path.shapes.size === 1) {
-        path.smooth = path.spline.copy();
-      } else {
-        path.smooth = new SplineSmoother(path.spline, opts).smooth();
+  _appendSplines(out, splines, bezBuf) {
+    for (const spline of splines) {
+      if (!spline) continue;
+      const need = (spline.n - spline.degree) * 6;
+      if (need > bezBuf.length) bezBuf = new Float32Array(need);
+      const count = spline.toBeziers(bezBuf);
+      if (!count) continue;
+      out.push('M', this._num(bezBuf[0]), ',', this._num(bezBuf[1]));
+      for (let k = 0; k < count; k++) {
+        const o = k * 6;
+        out.push('Q', this._num(bezBuf[o+2]), ',', this._num(bezBuf[o+3]),
+                 ' ', this._num(bezBuf[o+4]), ',', this._num(bezBuf[o+5]));
+      }
+      out.push('Z');
+    }
+    return bezBuf;
+  }
+
+  _appendCellPolygon(out, pi) {
+    const pd = this.pd;
+    const buf = CELL_BUF, angBuf = CELL_ANG;
+    let n = 0;
+    let cx = 0, cy = 0;
+    if (pd.cornerOver && pd.cornerOver.has(pi)) {
+      for (const k of pd.cornerOver.get(pi)) {
+        const vx = (k % pd.gw) / Q4, vy = ((k / pd.gw) | 0) / Q4;
+        buf[n*2] = vx; buf[n*2 + 1] = vy; cx += vx; cy += vy; n++;
+      }
+    } else {
+      const base = pi * 8, cnt = pd.cornerCount[pi];
+      for (let j = 0; j < cnt; j++) {
+        const k = pd.cornerBuf[base + j];
+        const vx = (k % pd.gw) / Q4, vy = ((k / pd.gw) | 0) / Q4;
+        buf[n*2] = vx; buf[n*2 + 1] = vy; cx += vx; cy += vy; n++;
       }
     }
+    if (n < 3) return;
+    cx /= n; cy /= n;
+    // Angular sort around centroid (insertion sort on small n is fast).
+    for (let i = 0; i < n; i++) {
+      angBuf[i] = Math.atan2(buf[i*2 + 1] - cy, buf[i*2] - cx);
+    }
+    for (let i = 1; i < n; i++) {
+      const aAng = angBuf[i], ax = buf[i*2], ay = buf[i*2 + 1];
+      let j = i - 1;
+      while (j >= 0 && angBuf[j] > aAng) {
+        angBuf[j+1] = angBuf[j];
+        buf[(j+1)*2] = buf[j*2]; buf[(j+1)*2 + 1] = buf[j*2 + 1];
+        j--;
+      }
+      angBuf[j+1] = aAng; buf[(j+1)*2] = ax; buf[(j+1)*2 + 1] = ay;
+    }
+    out.push('M', this._num(buf[0]), ',', this._num(buf[1]));
+    for (let i = 1; i < n; i++) out.push('L', this._num(buf[i*2]), ',', this._num(buf[i*2 + 1]));
+    out.push('Z');
   }
-  return writer.render({ ...opts, mode });
+}
+// Scratch for cell polygon rendering — cells max 8 corners, rarely more.
+const CELL_BUF = new Float32Array(32);
+const CELL_ANG = new Float32Array(16);
+
+// ============================================================================
+// Public entry point
+// ============================================================================
+function depixelize(image, opts = {}) {
+  const { scale = 40, smooth = true } = opts;
+  const pd = new PixelData(image.width, image.height, image.data);
+  if (smooth !== false) {
+    for (const path of pd.paths) path.fitSpline();
+    for (const path of pd.paths) {
+      if (!path.spline) continue;
+      if (path.shapes.size === 1) path.smooth = path.spline.copy();
+      else                        path.smooth = smoothSpline(path.spline, opts);
+    }
+  }
+  return new SVGWriter(pd, scale).render();
 }
 
-// ---------- exports ----------------------------------------------------------
+// ============================================================================
+// Exports
+// ============================================================================
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { depixelize, PixelData, SVGWriter, ClosedBSpline, SplineSmoother, Graph };
+  module.exports = { depixelize, PixelData, SVGWriter, ClosedBSpline, smoothSpline };
 }
 if (typeof window !== 'undefined') window.depixelize = depixelize;
