@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Depixelize — browser demo</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 0; padding: 24px; max-width: 1100px; }
+  h1 { margin: 0 0 4px; font-size: 20px; }
+  p.sub { margin: 0 0 20px; opacity: .7; }
+  .drop {
+    border: 2px dashed currentColor; padding: 24px; text-align: center;
+    border-radius: 8px; cursor: pointer; opacity: .6;
+  }
+  .drop.hover { opacity: 1; }
+  .panes {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 20px;
+  }
+  .pane { border: 1px solid #8884; padding: 12px; border-radius: 6px; min-height: 200px; }
+  .pane h3 { margin: 0 0 8px; font-size: 13px; font-weight: 600; opacity: .75; }
+  .pane .stage { display: flex; align-items: center; justify-content: center; min-height: 260px; overflow: auto; }
+  canvas, .pane svg { max-width: 100%; max-height: 420px; image-rendering: pixelated; }
+  .pane svg { image-rendering: auto; }
+  .controls { display: flex; gap: 16px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
+  .controls label { display: flex; gap: 6px; align-items: center; }
+  .controls input[type=range] { width: 140px; }
+  .stat { font-family: ui-monospace, monospace; opacity: .7; font-size: 12px; }
+  button { font: inherit; padding: 6px 12px; border-radius: 4px; border: 1px solid #8884; cursor: pointer; background: transparent; color: inherit; }
+</style>
+</head>
+<body>
+<h1>Depixelize — browser demo</h1>
+<p class="sub">Drop a small pixel-art PNG (or click to select). Resolution-independent SVG appears on the right.</p>
+
+<div class="drop" id="drop">Drop a PNG here, or click to pick a file.</div>
+<input type="file" id="file" accept="image/*" style="display:none">
+
+<div class="controls">
+  <label>mode
+    <select id="mode">
+      <option value="auto">auto</option>
+      <option value="shape">shape (classic pixel art)</option>
+      <option value="cell">cell (photos / gradients)</option>
+    </select>
+  </label>
+  <label>scale <input type="range" id="scale" min="4" max="60" value="30"></label>
+  <label>iterations <input type="range" id="iter" min="0" max="40" value="20"></label>
+  <label>guesses <input type="range" id="guess" min="1" max="40" value="20"></label>
+  <label>offset <input type="range" id="off" min="1" max="20" value="5"></label>
+  <label><input type="checkbox" id="smooth" checked> smooth</label>
+  <button id="run">Re-run</button>
+  <button id="dl">Download SVG</button>
+  <span class="stat" id="stat"></span>
+</div>
+
+<div class="panes">
+  <div class="pane">
+    <h3>Input (nearest-neighbor upscale)</h3>
+    <div class="stage"><canvas id="inCv"></canvas></div>
+  </div>
+  <div class="pane">
+    <h3>Depixelized (SVG)</h3>
+    <div class="stage" id="outStage"></div>
+  </div>
+</div>
+
+<script src="depixelize.js"></script>
+<script>
+let currentImageData = null, currentSvg = '';
+
+function loadFile(file) {
+  const img = new Image();
+  img.onload = () => {
+    const cv = document.createElement('canvas');
+    cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+    const ctx = cv.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(img, 0, 0);
+    currentImageData = ctx.getImageData(0, 0, cv.width, cv.height);
+
+    // show nearest-neighbor input
+    const inCv = document.getElementById('inCv');
+    const S = 16;
+    inCv.width = cv.width * S; inCv.height = cv.height * S;
+    const ictx = inCv.getContext('2d');
+    ictx.imageSmoothingEnabled = false;
+    ictx.drawImage(cv, 0, 0, inCv.width, inCv.height);
+
+    run();
+  };
+  img.src = URL.createObjectURL(file);
+}
+
+function run() {
+  if (!currentImageData) return;
+  const modeRaw = document.getElementById('mode').value;
+  const opts = {
+    scale:       +document.getElementById('scale').value,
+    iterations:  +document.getElementById('iter').value,
+    guesses:     +document.getElementById('guess').value,
+    guessOffset: +document.getElementById('off').value / 100,
+    smooth:      document.getElementById('smooth').checked,
+  };
+  if (modeRaw !== 'auto') opts.mode = modeRaw;
+  const t0 = performance.now();
+  currentSvg = depixelize(currentImageData, opts);
+  const ms = performance.now() - t0;
+  document.getElementById('outStage').innerHTML = currentSvg;
+  document.getElementById('stat').textContent =
+    `${currentImageData.width}×${currentImageData.height}px → ${currentSvg.length} B SVG in ${ms.toFixed(0)} ms`;
+}
+
+// Drag & drop
+const drop = document.getElementById('drop'), fileInput = document.getElementById('file');
+drop.addEventListener('click', () => fileInput.click());
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('hover'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('hover'));
+drop.addEventListener('drop', e => {
+  e.preventDefault(); drop.classList.remove('hover');
+  if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+
+// Controls
+document.getElementById('run').addEventListener('click', run);
+for (const id of ['mode','scale','iter','guess','off','smooth']) {
+  document.getElementById(id).addEventListener('change', run);
+}
+document.getElementById('dl').addEventListener('click', () => {
+  if (!currentSvg) return;
+  const blob = new Blob([currentSvg], { type: 'image/svg+xml' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = 'depixelized.svg';
+  a.click();
+});
+
+// Seed with a built-in demo so the page isn't empty.
+(function demoSeed() {
+  const grid = [
+    '....KKKKKK....',
+    '..KKRRRRRRKK..',
+    '.KRRWWRRRWWRK.',
+    '.KRWWWRRWWWRK.',
+    'KRRWWRRRRWWRRK',
+    'KRRRRRRRRRRRRK',
+    'KRWWWRRRRWWWRK',
+    '.KWWWRRRRWWWK.',
+    '..KKSSSSSSKK..',
+    '..KSSSSSSSSK..',
+    '..KSKKSSKKSK..',
+    '..KSKSSSSKSK..',
+    '..KSSSSSSSSK..',
+    '...KKKKKKKK...',
+  ];
+  const pal = { K:[20,20,20], R:[220,40,40], W:[250,250,250], S:[250,200,160], '.':[255,255,255] };
+  const w = grid[0].length, h = grid.length;
+  const data = new Uint8ClampedArray(w*h*4);
+  for (let y=0;y<h;y++) for (let x=0;x<w;x++) {
+    const [r,g,b] = pal[grid[y][x]]; const i=(y*w+x)*4;
+    data[i]=r; data[i+1]=g; data[i+2]=b; data[i+3]=255;
+  }
+  currentImageData = new ImageData(data, w, h);
+  const inCv = document.getElementById('inCv');
+  const S = 16; inCv.width = w*S; inCv.height = h*S;
+  const ictx = inCv.getContext('2d'); ictx.imageSmoothingEnabled = false;
+  const src = document.createElement('canvas'); src.width=w; src.height=h;
+  src.getContext('2d').putImageData(currentImageData, 0, 0);
+  ictx.drawImage(src, 0, 0, w*S, h*S);
+  run();
+})();
+</script>
+</body>
+</html>
