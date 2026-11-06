@@ -1,143 +1,277 @@
 // depixelize.js — Resolution-independent vectorization of pixel art.
-// Cell-mode-only implementation of Kopf & Lischinski (2011).
-// Single file, zero dependencies. Optimized with TypedArrays and packed
-// integer keys throughout (no string nodes, no Map of Sets where avoidable).
+// Implementation of Kopf & Lischinski, "Depixelizing Pixel Art" (SIGGRAPH 2011).
+// Single file, zero dependencies, browser + Node.
 //
-// Usage (browser):   const svg = depixelize(imageData);
-// Usage (Node):      const svg = depixelize({ data, width, height });
+// Usage (browser):   const svg = depixelize(imageData, opts);
+// Usage (Node):      const svg = depixelize({ data, width, height }, opts);
 //
 // Options:
-//   scale        40     SVG output scale
-//   smooth       true   run random-relaxation spline smoothing
-//   iterations   20     outer smoothing iterations
-//   guesses      20     random candidates per control point per iteration
-//   guessOffset  0.05   max random displacement in pixel units
+//   scale        40      SVG units per input pixel
+//   mode         'auto'  'cell'  — a region is a group of similar pixels (as in
+//                                  the paper); colour varies smoothly inside it
+//                        'shape' — a region is a group of identical pixels;
+//                                  every colour boundary becomes a curve
+//                        'auto'  — per region: banded shading stays crisp,
+//                                  gradients / dither / noise are smoothed
+//   smooth       true    optimise the curve control points (paper §3.4)
+//   iterations   20      relaxation sweeps
+//   guesses      20      random candidates per control point per sweep
+//   guessOffset  0.05    max displacement of one candidate (pixels)
+//   shading      0.7     σ (pixels) of the edge-aware colour interpolation used
+//                        inside multi-colour regions; 0 = flat cells
+//   seed         1       PRNG seed — output is deterministic
+//
+// Pipeline
+//   1. Similarity graph (hqx YUV thresholds, alpha aware) and resolution of
+//      crossing diagonals (curves / sparse pixels / islands heuristics).
+//   2. Reshaped pixel cells: the simplified generalised Voronoi diagram is
+//      pasted together from per-corner templates; every node sits on the
+//      ¼-pixel lattice and every cell edge knows the pixel on its other side.
+//   3. Regions: connected pixels that are rendered as one area.
+//   4. Visible edges (between regions, or on the image frame) are chained into
+//      curves that are SHARED by the two regions they separate. 3-way
+//      junctions become T-junctions (contour edges beat shading edges,
+//      otherwise the straightest pair continues).
+//   5. Quadratic B-splines through the node lattice, corner patterns (Fig. 7)
+//      excluded from the smoothness term, control points optimised by random
+//      relaxation of  E = ∫|κ| ds + |p − p̂|⁴  (∫|κ| ds evaluated exactly).
+//   6. SVG: every region outline is assembled from the shared curve pieces, so
+//      neighbours meet exactly — no gaps and no pixel backdrop. Regions with
+//      several colours get an edge-aware Gaussian colour interpolation.
 
 'use strict';
 
 // ============================================================================
-// Integer key packing
+// Constants and small helpers
 // ============================================================================
-// Grid corner coordinates are quantized to quarter-pixel after cell
-// deformation, so every corner has coordinates in N/4 where N is an integer.
-// We store positions scaled ×4 (= Q4) so keys are plain ints.
-//
-//   corner key  =  (iy * gw) + ix      where ix,iy in [0..(w+1)*Q4]
-//   pixel key   =   y * w + x          plain raster index
-const Q4 = 4;
+const ALPHA_CUT    = 16;    // alpha below this counts as fully transparent
+const SHADING_DIST = 100;   // YUV distance up to which a visible edge is a "shading" edge
+const FRAGMENT     = 3;     // similar-colour groups up to this size may be absorbed…
+const ABSORB_DIST  = 40;    // …into an edge-adjacent group within this YUV distance
+const UP = 0, RIGHT = 1, DOWN = 2, LEFT = 3;
+const TWO_PI = Math.PI * 2;
+
+// Which node terminates a cell side that arrives at a pixel corner, indexed
+// [cornerType * 4 + direction]. Corner types: 0 = no diagonal through the
+// corner, 1 = TL–BR diagonal kept, 2 = TR–BL diagonal kept. A chamfered corner
+// C is replaced by two nodes (slot 0 / slot 1):
+//   type 1: a = C + (¼, −¼), b = C + (−¼, ¼)     type 2: a = C + (−¼, −¼), b = C + (¼, ¼)
+const E_SLOT = new Uint8Array([
+  0, 0, 0, 0,
+  0, 0, 1, 1,
+  0, 1, 1, 0,
+]);
+
+const DEFAULTS = {
+  scale: 40, mode: 'auto', smooth: true, iterations: 20, guesses: 20,
+  guessOffset: 0.05, shading: 0.7, seed: 1,
+};
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function grow(a, n) { const b = new a.constructor(n); b.set(a); return b; }
+
+// Corner patterns of Fig. 7 in ¼-pixel units relative to the pixel's top-left
+// corner, expanded to all 8 symmetries and both traversal directions. These
+// are the places where a curve wraps tightly around a single pixel (tips of
+// one-pixel-wide features); their curvature is intentional.
+const CORNER_PATTERNS = (() => {
+  const base = [
+    [0, 4, 1, 1, 3, 1, 4, 4],
+    [-1, 3, 1, 1, 3, 1, 4, 4],
+    [-1, 3, 1, 1, 3, 1, 5, 3],
+    [0, 4, 0, 0, 4, 0, 4, 4],
+    [3, 5, 1, 3, 1, 1, 3, 1, 5, 3],
+  ];
+  const seen = new Set(), out = [];
+  for (const p of base) for (let s = 0; s < 8; s++) for (let rev = 0; rev < 2; rev++) {
+    const L = p.length >> 1, q = new Int32Array(p.length);
+    for (let k = 0; k < L; k++) {
+      let dx = p[2 * k] - 2, dy = p[2 * k + 1] - 2;
+      if (s & 4) dx = -dx;
+      for (let r = 0; r < (s & 3); r++) { const t = dx; dx = -dy; dy = t; }
+      const d = rev ? L - 1 - k : k;
+      q[2 * d] = dx + 2; q[2 * d + 1] = dy + 2;
+    }
+    const key = q.join(',');
+    if (!seen.has(key)) { seen.add(key); out.push(q); }
+  }
+  return out;
+})();
 
 // ============================================================================
-// PixelData — full pipeline. All graphs use integer node IDs; adjacency
-// stored in TypedArrays where feasible.
+// Curves. Control points P0..Pn for an open curve with n edges (P0, Pn sit on
+// junctions), P0..P(n-1) for a closed one. The quadratic B-spline is split
+// into one Bézier segment per interior control point s: A_s → (P_s) → C_s.
+// Every control point k also has a "node point" Q_k on the curve; the piece
+// of curve between Q_k and Q_(k+1) belongs to edge k, which is what lets two
+// regions share the same geometry for the same edge.
+// ============================================================================
+function segA(c, s, o) {
+  const x = c.x, y = c.y;
+  if (!c.closed && s === 1) { o[0] = x[0]; o[1] = y[0]; return; }
+  const p = s === 0 ? c.n - 1 : s - 1;
+  o[0] = (x[p] + x[s]) * 0.5; o[1] = (y[p] + y[s]) * 0.5;
+}
+function segC(c, s, o) {
+  const x = c.x, y = c.y, n = c.n;
+  if (!c.closed && s === n - 1) { o[0] = x[n]; o[1] = y[n]; return; }
+  const q = s === n - 1 ? 0 : s + 1;
+  o[0] = (x[s] + x[q]) * 0.5; o[1] = (y[s] + y[q]) * 0.5;
+}
+const _A = new Float64Array(2), _C = new Float64Array(2);
+function nodePt(c, k, o) {
+  const x = c.x, y = c.y;
+  if (c.border || (!c.closed && (k === 0 || k === c.n))) { o[0] = x[k]; o[1] = y[k]; return; }
+  segA(c, k, _A); segC(c, k, _C);
+  o[0] = (_A[0] + 2 * x[k] + _C[0]) * 0.25;
+  o[1] = (_A[1] + 2 * y[k] + _C[1]) * 0.25;
+}
+
+// |turning angle| of the control polygon at b. For a uniform quadratic
+// B-spline the segment around control point b is a parabola whose tangent
+// turns monotonically from (P_b − P_a) to (P_c − P_b), so ∫|κ| ds over that
+// segment equals this angle exactly.
+function turn(x, y, a, b, c) {
+  const ux = x[b] - x[a], uy = y[b] - y[a], vx = x[c] - x[b], vy = y[c] - y[b];
+  return Math.abs(Math.atan2(ux * vy - uy * vx, ux * vx + uy * vy));
+}
+
+// Energy of control point i (paper eq. 2–4): smoothness of the three segments
+// it influences (corner-pattern segments excluded) + |p − p̂|⁴.
+function nodeEnergy(c, i) {
+  const x = c.x, y = c.y, ex = c.excl, n = c.n;
+  let E = 0;
+  if (c.closed) {
+    for (let d = -1; d <= 1; d++) {
+      let j = i + d; if (j < 0) j += n; else if (j >= n) j -= n;
+      if (ex[j]) continue;
+      E += turn(x, y, j === 0 ? n - 1 : j - 1, j, j === n - 1 ? 0 : j + 1);
+    }
+  } else {
+    const lo = i > 1 ? i - 1 : 1, hi = i < n - 1 ? i + 1 : n - 1;
+    for (let j = lo; j <= hi; j++) if (!ex[j]) E += turn(x, y, j - 1, j, j + 1);
+  }
+  const dx = x[i] - c.ox[i], dy = y[i] - c.oy[i], d2 = dx * dx + dy * dy;
+  return E + d2 * d2;
+}
+
+// ============================================================================
+// PixelData — the whole geometric pipeline.
 // ============================================================================
 class PixelData {
-  constructor(w, h, rgba) {
-    this.w = w; this.h = h;
-    const N = w * h;
-
-    // ---- pack RGB (0xRRGGBB) + YUV diffs ---------------------------------
-    const rgb = this.rgb = new Uint32Array(N);
-    const yuv = this.yuv = new Int16Array(N * 3);
-    for (let i = 0, j = 0; i < N; i++, j += 4) {
-      const r = rgba[j], g = rgba[j+1], b = rgba[j+2];
-      rgb[i] = (r << 16) | (g << 8) | b;
-      const y = (77 * r + 150 * g + 29 * b) >> 8;    // ~0.299r + 0.587g + 0.114b
-      yuv[i*3    ] = y;
-      yuv[i*3 + 1] = (126 * (b - y)) >> 8;           // ~0.492 * (b - y)
-      yuv[i*3 + 2] = (224 * (r - y)) >> 8;           // ~0.877 * (r - y)
-    }
-
-    // ---- pixel similarity graph -----------------------------------------
-    // 4 forward-direction bits per pixel in a Uint8Array.
-    //   bit 0 : +x             bit 1 : +y
-    //   bit 2 : +x+y (SE)      bit 3 : +x-y (NE)
-    // Backward edges read from the neighbor's forward bit — no duplication.
-    this.neigh = new Uint8Array(N);
+  constructor(width, height, data, opts = {}) {
+    const w = width | 0, h = height | 0;
+    if (w <= 0 || h <= 0) throw new RangeError('depixelize: image must be at least 1×1');
+    if (!data || data.length < w * h * 3) throw new RangeError('depixelize: pixel data too short');
+    this.w = w; this.h = h; this.N = w * h;
+    this._readPixels(data);
     this._buildSimilarityGraph();
     this._removeDiagonals();
-
-    // ---- corner grid ----------------------------------------------------
-    this.gw = (w + 1) * Q4 + 1;
-    this.gh = (h + 1) * Q4 + 1;
-    this.grid = new FixedGraph(this.gw * this.gh);
-
-    // Per-pixel corner sets. Fixed-stride Uint32Array: cornerBuf[i*8 .. +7],
-    // counts in cornerCount[i]. Overflow (rare) spills to cornerOver Map.
-    this.cornerBuf   = new Uint32Array(N * 8);
-    this.cornerCount = new Uint8Array(N);
-    this.cornerOver  = null;
-
-    this._buildGridGraph();
-    this._deformGrid();
-
-    // ---- shapes, outlines, paths ---------------------------------------
-    // Size the shared localIdxMap for this image.
-    if (localIdxMap.length < this.gw * this.gh) {
-      localIdxMap = new Int32Array(this.gw * this.gh);
-    } else {
-      localIdxMap.fill(0);
-    }
-    this._findShapes();
-    this._findOutlines();
-    this._assignPaths();
+    this._buildCells();
+    this._buildRegions(opts.mode || 'auto');
+    this._buildBoundaries();
+    this._traceLoops();
+    this._buildCurves();
+    this._detectCorners();
   }
 
-  // ---- similarity test (hot) ------------------------------------------
-  similar(ai, bi) {
-    const y = this.yuv;
-    const dy = y[ai*3  ] - y[bi*3  ]; if (dy >  48 || dy < -48) return false;
-    const du = y[ai*3+1] - y[bi*3+1]; if (du >   7 || du <  -7) return false;
-    const dv = y[ai*3+2] - y[bi*3+2]; if (dv >   6 || dv <  -6) return false;
+  // ---- pixels -----------------------------------------------------------------
+  _readPixels(data) {
+    const N = this.N, stride = data.length >= N * 4 ? 4 : 3;
+    const rgb = this.rgb = new Uint32Array(N);
+    const alpha = this.alpha = new Uint8Array(N);
+    const key = this.key = new Uint32Array(N);      // exact colour identity, 0 = transparent
+    const yuv = this.yuv = new Int16Array(N * 3);
+    let opaque = true;
+    for (let i = 0, j = 0; i < N; i++, j += stride) {
+      const a = stride === 4 ? data[j + 3] : 255;
+      if (a < 255) opaque = false;
+      if (a < ALPHA_CUT) continue;
+      const r = data[j], g = data[j + 1], b = data[j + 2];
+      const c = (r << 16) | (g << 8) | b;
+      rgb[i] = c; alpha[i] = a;
+      key[i] = ((c << 8) | a) >>> 0;
+      const y = (77 * r + 150 * g + 29 * b) >> 8;     // ~0.299r + 0.587g + 0.114b
+      yuv[i * 3] = y;
+      yuv[i * 3 + 1] = (126 * (b - y)) >> 8;           // ~0.492 (b − y)
+      yuv[i * 3 + 2] = (224 * (r - y)) >> 8;           // ~0.877 (r − y)
+    }
+    this.opaque = opaque;
+  }
+
+  similar(i, j) {
+    const A = this.alpha, ai = A[i], aj = A[j];
+    if (ai === 0 || aj === 0) return ai === aj;
+    const da = ai - aj; if (da > 32 || da < -32) return false;
+    const Y = this.yuv, p = i * 3, q = j * 3;
+    const dy = Y[p] - Y[q];         if (dy > 48 || dy < -48) return false;
+    const du = Y[p + 1] - Y[q + 1]; if (du > 7 || du < -7) return false;
+    const dv = Y[p + 2] - Y[q + 2]; if (dv > 6 || dv < -6) return false;
     return true;
   }
 
+  yuvDist(i, j) {
+    const A = this.alpha;
+    if (A[i] === 0 || A[j] === 0) return A[i] === A[j] ? 0 : 1e9;
+    const Y = this.yuv, p = i * 3, q = j * 3;
+    const dy = Y[p] - Y[q], du = Y[p + 1] - Y[q + 1], dv = Y[p + 2] - Y[q + 2], da = A[i] - A[j];
+    return Math.sqrt(dy * dy + du * du + dv * dv + da * da);
+  }
+
+  // ---- similarity graph ------------------------------------------------------
+  // 4 forward bits per pixel: 1 = +x, 2 = +y, 4 = +x+y (SE), 8 = +x−y (NE).
   _buildSimilarityGraph() {
-    const { w, h, neigh } = this;
+    const { w, h } = this;
+    const neigh = this.neigh = new Uint8Array(this.N);
     for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
       const i = y * w + x;
-      if (x + 1 < w && this.similar(i, i + 1))                  neigh[i] |= 1;
-      if (y + 1 < h && this.similar(i, i + w))                  neigh[i] |= 2;
-      if (x + 1 < w && y + 1 < h && this.similar(i, i + w + 1)) neigh[i] |= 4;
-      if (x + 1 < w && y > 0     && this.similar(i, i - w + 1)) neigh[i] |= 8;
+      let n = 0;
+      if (x + 1 < w && this.similar(i, i + 1)) n |= 1;
+      if (y + 1 < h && this.similar(i, i + w)) n |= 2;
+      if (x + 1 < w && y + 1 < h && this.similar(i, i + w + 1)) n |= 4;
+      if (x + 1 < w && y > 0 && this.similar(i, i - w + 1)) n |= 8;
+      neigh[i] = n;
     }
   }
 
-  // Enumerate all pixel neighbors of pixel i. Used in hot loops — avoid
-  // generators here by writing into a caller-supplied scratch buffer.
-  // Returns count of neighbors written.
   pxNeighbors(i, out) {
     const w = this.w, h = this.h, neigh = this.neigh;
-    const x = i % w, y = (i / w) | 0;
-    const n = neigh[i];
+    const x = i % w, y = (i / w) | 0, n = neigh[i];
     let c = 0;
     if (n & 1) out[c++] = i + 1;
     if (n & 2) out[c++] = i + w;
     if (n & 4) out[c++] = i + w + 1;
     if (n & 8) out[c++] = i - w + 1;
-    if (x > 0     && (neigh[i - 1]     & 1)) out[c++] = i - 1;
-    if (y > 0     && (neigh[i - w]     & 2)) out[c++] = i - w;
-    if (x > 0 && y > 0     && (neigh[i - w - 1] & 4)) out[c++] = i - w - 1;
+    if (x > 0 && (neigh[i - 1] & 1)) out[c++] = i - 1;
+    if (y > 0 && (neigh[i - w] & 2)) out[c++] = i - w;
+    if (x > 0 && y > 0 && (neigh[i - w - 1] & 4)) out[c++] = i - w - 1;
     if (x > 0 && y + 1 < h && (neigh[i + w - 1] & 8)) out[c++] = i + w - 1;
     return c;
   }
 
   pxDegree(i) {
     const w = this.w, h = this.h, neigh = this.neigh;
-    const x = i % w, y = (i / w) | 0;
-    const n = neigh[i];
+    const x = i % w, y = (i / w) | 0, n = neigh[i];
     let d = (n & 1) + ((n >> 1) & 1) + ((n >> 2) & 1) + ((n >> 3) & 1);
-    if (x > 0     &&     (neigh[i - 1]     & 1)) d++;
-    if (y > 0     &&     (neigh[i - w]     & 2)) d++;
-    if (x > 0 && y > 0     && (neigh[i - w - 1] & 4)) d++;
+    if (x > 0 && (neigh[i - 1] & 1)) d++;
+    if (y > 0 && (neigh[i - w] & 2)) d++;
+    if (x > 0 && y > 0 && (neigh[i - w - 1] & 4)) d++;
     if (x > 0 && y + 1 < h && (neigh[i + w - 1] & 8)) d++;
     return d;
   }
 
   _rmPxEdge(a, b) {
     const w = this.w;
-    const ax = a % w, ay = (a / w) | 0;
-    const bx = b % w, by = (b / w) | 0;
-    const dx = bx - ax, dy = by - ay;
+    const dx = (b % w) - (a % w), dy = ((b / w) | 0) - ((a / w) | 0);
     if      (dx ===  1 && dy ===  0) this.neigh[a] &= ~1;
     else if (dx ===  0 && dy ===  1) this.neigh[a] &= ~2;
     else if (dx ===  1 && dy ===  1) this.neigh[a] &= ~4;
@@ -148,1180 +282,883 @@ class PixelData {
     else if (dx === -1 && dy ===  1) this.neigh[b] &= ~8;
   }
 
-  // ==========================================================================
-  // Diagonal removal + heuristics.
-  // ==========================================================================
+  // ---- crossing diagonals (paper §3.2) ------------------------------------------
   _removeDiagonals() {
     const { w, h, neigh } = this;
     const ambiguous = [];
     for (let y = 0; y < h - 1; y++) for (let x = 0; x < w - 1; x++) {
       const tl = y * w + x, tr = tl + 1, bl = tl + w, br = bl + 1;
-      const eTL_TR = (neigh[tl] & 1) !== 0;
-      const eBL_BR = (neigh[bl] & 1) !== 0;
-      const eTL_BL = (neigh[tl] & 2) !== 0;
-      const eTR_BR = (neigh[tr] & 2) !== 0;
-      const eTL_BR = (neigh[tl] & 4) !== 0;
-      const eBL_TR = (neigh[bl] & 8) !== 0;
-      if (!eTL_BR || !eBL_TR) continue;
-      const card = (eTL_TR?1:0)+(eBL_BR?1:0)+(eTL_BL?1:0)+(eTR_BR?1:0);
-      if (card === 4) {
-        neigh[tl] &= ~4;
-        neigh[bl] &= ~8;
-      } else if (card === 0) {
-        ambiguous.push(tl, br, bl, tr);   // flat: a1,b1,a2,b2
+      if (!(neigh[tl] & 4) || !(neigh[bl] & 8)) continue;
+      const card = (neigh[tl] & 1 ? 1 : 0) + (neigh[bl] & 1 ? 1 : 0) +
+                   (neigh[tl] & 2 ? 1 : 0) + (neigh[tr] & 2 ? 1 : 0);
+      if (card === 4) {                 // flat shaded block: both diagonals are redundant
+        neigh[tl] &= ~4; neigh[bl] &= ~8;
+      } else if (card === 0) {          // genuinely ambiguous: decided by the heuristics
+        ambiguous.push(tl, br, bl, tr);
+      } else {
+        // Partially connected block (possible because similarity is not
+        // transitive). Keep the closer pair so the graph stays planar.
+        const d1 = this.yuvDist(tl, br), d2 = this.yuvDist(bl, tr);
+        if (d1 >= d2) neigh[tl] &= ~4;
+        if (d2 >= d1) neigh[bl] &= ~8;
       }
     }
     if (ambiguous.length) this._applyHeuristics(ambiguous);
   }
 
-  _hCurve(a, b, seenScratch) {
-    seenScratch.fill(0);
-    seenScratch[a] = 1; seenScratch[b] = 1;
-    const stack = [a, b];
-    let count = 2;
-    const nbs = new Int32Array(8);
-    while (stack.length) {
-      const n = stack.pop();
+  _applyHeuristics(flat) {
+    this._mark = new Uint32Array(this.N);
+    this._stamp = 0;
+    this._stk = new Int32Array(this.N + 8);
+    this._nbs = new Int32Array(8);
+    for (let k = 0; k < flat.length; k += 4) {
+      const a1 = flat[k], b1 = flat[k + 1], a2 = flat[k + 2], b2 = flat[k + 3];
+      const w1 = this._hCurve(a1, b1) + this._hSparse(a1, b1) + this._hIsland(a1, b1);
+      const w2 = this._hCurve(a2, b2) + this._hSparse(a2, b2) + this._hIsland(a2, b2);
+      if (w1 <= w2) this._rmPxEdge(a1, b1);      // tie: both removed
+      if (w2 <= w1) this._rmPxEdge(a2, b2);
+    }
+    this._mark = this._stk = null;
+  }
+
+  // Length of the valence-2 curve the diagonal belongs to (in nodes).
+  _hCurve(a, b) {
+    const mark = this._mark, stk = this._stk, nbs = this._nbs, s = ++this._stamp;
+    mark[a] = s; mark[b] = s;
+    let sp = 0, count = 2;
+    stk[sp++] = a; stk[sp++] = b;
+    while (sp) {
+      const n = stk[--sp];
       if (this.pxDegree(n) !== 2) continue;
       const nc = this.pxNeighbors(n, nbs);
       for (let k = 0; k < nc; k++) {
         const m = nbs[k];
-        if (!seenScratch[m]) { seenScratch[m] = 1; count++; stack.push(m); }
+        if (mark[m] !== s) { mark[m] = s; count++; stk[sp++] = m; }
       }
     }
     return count;
   }
-  _hSparse(a, b, seenScratch) {
-    const w = this.w;
-    const ax = a % w, ay = (a / w) | 0;
-    const bx = b % w, by = (b / w) | 0;
-    const ox = 3 - Math.min(ax, bx), oy = 3 - Math.min(ay, by);
-    seenScratch.fill(0);
-    seenScratch[a] = 1; seenScratch[b] = 1;
-    const stack = [a, b];
-    let count = 2;
-    const nbs = new Int32Array(8);
-    while (stack.length) {
-      const n = stack.pop();
-      const nc = this.pxNeighbors(n, nbs);
+
+  // Minus the size of the component in an 8×8 window centred on the block.
+  _hSparse(a, b) {
+    const w = this.w, mark = this._mark, stk = this._stk, nbs = this._nbs, s = ++this._stamp;
+    const x0 = Math.min(a % w, b % w) - 3, y0 = Math.min((a / w) | 0, (b / w) | 0) - 3;
+    mark[a] = s; mark[b] = s;
+    let sp = 0, count = 2;
+    stk[sp++] = a; stk[sp++] = b;
+    while (sp) {
+      const n = stk[--sp], nc = this.pxNeighbors(n, nbs);
       for (let k = 0; k < nc; k++) {
         const m = nbs[k];
-        if (seenScratch[m]) continue;
-        const mx = m % w, my = (m / w) | 0;
-        const px = mx + ox, py = my + oy;
-        if (px >= 0 && px < 8 && py >= 0 && py < 8) {
-          seenScratch[m] = 1; count++; stack.push(m);
-        }
+        if (mark[m] === s) continue;
+        const mx = (m % w) - x0, my = ((m / w) | 0) - y0;
+        if (mx >= 0 && mx < 8 && my >= 0 && my < 8) { mark[m] = s; count++; stk[sp++] = m; }
       }
     }
     return -count;
   }
+
   _hIsland(a, b) {
     return (this.pxDegree(a) === 1 || this.pxDegree(b) === 1) ? 5 : 0;
   }
-  _applyHeuristics(flat) {
-    const seen = new Uint8Array(this.w * this.h);
-    for (let k = 0; k < flat.length; k += 4) {
-      const a1 = flat[k], b1 = flat[k+1], a2 = flat[k+2], b2 = flat[k+3];
-      const w1 = this._hCurve(a1, b1, seen) + this._hSparse(a1, b1, seen) + this._hIsland(a1, b1);
-      const w2 = this._hCurve(a2, b2, seen) + this._hSparse(a2, b2, seen) + this._hIsland(a2, b2);
-      if (w1 <= w2) this._rmPxEdge(a1, b1);
-      if (w2 <= w1) this._rmPxEdge(a2, b2);
-    }
-  }
 
-  // ==========================================================================
-  // Grid graph on the quarter-pixel lattice.
-  // ==========================================================================
-  _buildGridGraph() {
-    const { w, h, gw } = this;
-    const grid = this.grid;
-    // Fast direct writes: during build every edge is unique, skip hasEdge.
-    const exists = grid.exists, adj = grid.adj, deg = grid.deg;
-    const GW4 = gw * Q4;    // row stride in corner keys
-    for (let y = 0; y <= h; y++) {
-      const rowBase = y * GW4;
-      for (let x = 0; x <= w; x++) {
-        const k = rowBase + x * Q4;
-        exists[k] = 1;
-        if (x < w) {
-          const r = rowBase + (x + 1) * Q4;
-          adj[k * MAX_DEG + deg[k]++] = r;
-          adj[r * MAX_DEG + deg[r]++] = k;
-        }
-        if (y < h) {
-          const d = rowBase + GW4 + x * Q4;
-          adj[k * MAX_DEG + deg[k]++] = d;
-          adj[d * MAX_DEG + deg[d]++] = k;
-        }
-      }
+  // ---- reshaped cells (paper §3.2, simplified Voronoi diagram) ------------------
+  // Nodes: two slots per pixel corner, id = corner * 2 + slot, coordinates in
+  // ¼-pixel units. Cell polygons run clockwise on screen (y down); edge k goes
+  // from vertex k to vertex k+1 and cellNb holds the pixel across it (−1 =
+  // outside the image).
+  _buildCells() {
+    const { w, h, N, neigh } = this;
+    const CW = w + 1, CH = h + 1;
+    const ctype = this.ctype = new Uint8Array(CW * CH);
+    for (let cy = 1; cy < h; cy++) for (let cx = 1; cx < w; cx++) {
+      const tl = (cy - 1) * w + cx - 1;
+      if (neigh[tl] & 4) ctype[cy * CW + cx] = 1;
+      else if (neigh[tl + w] & 8) ctype[cy * CW + cx] = 2;
     }
-    // Initial 4 corners per pixel — direct buffer writes.
-    const cBuf = this.cornerBuf, cCnt = this.cornerCount;
-    for (let y = 0; y < h; y++) {
-      const top = y * Q4 * gw;
-      const bot = (y + 1) * Q4 * gw;
-      for (let x = 0; x < w; x++) {
-        const i = y * w + x;
-        const leftQ  = x * Q4;
-        const rightQ = (x + 1) * Q4;
-        const base = i * 8;
-        cBuf[base    ] = top + leftQ;
-        cBuf[base + 1] = top + rightQ;
-        cBuf[base + 2] = bot + leftQ;
-        cBuf[base + 3] = bot + rightQ;
-        cCnt[i] = 4;
-      }
+    const NN = this.nodeCount = CW * CH * 2;
+    const X = this.nodeX = new Int32Array(NN), Y = this.nodeY = new Int32Array(NN);
+    for (let cy = 0, c = 0; cy < CH; cy++) for (let cx = 0; cx < CW; cx++, c++) {
+      const t = ctype[c], x4 = cx * 4, y4 = cy * 4, n = c * 2;
+      if (t === 0)      { X[n] = x4;     Y[n] = y4;     X[n + 1] = x4;     Y[n + 1] = y4; }
+      else if (t === 1) { X[n] = x4 + 1; Y[n] = y4 - 1; X[n + 1] = x4 - 1; Y[n + 1] = y4 + 1; }
+      else              { X[n] = x4 - 1; Y[n] = y4 - 1; X[n + 1] = x4 + 1; Y[n + 1] = y4 + 1; }
     }
-  }
-
-  // Write corner keys of pixel pi into out[]; return count.
-  cornersArray(pi, out) {
-    if (this.cornerOver) {
-      const s = this.cornerOver.get(pi);
-      if (s) { let i = 0; for (const k of s) out[i++] = k; return i; }
-    }
-    const base = pi * 8, n = this.cornerCount[pi];
-    for (let j = 0; j < n; j++) out[j] = this.cornerBuf[base + j];
-    return n;
-  }
-
-  // ==========================================================================
-  // Cell deformation.
-  // ==========================================================================
-  _deformGrid() {
-    const { w, h, neigh } = this;
+    const V = this.cellV = new Int32Array(N * 8);
+    const NB = this.cellNb = new Int32Array(N * 8);
+    const CN = this.cellN = new Uint8Array(N);
     for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-      const i = y * w + x;
-      const n = neigh[i];
-      if (n & 4) this._deformCell(x, y, x + 1, y + 1);
-      if (n & 8) this._deformCell(x, y, x + 1, y - 1);
-      if (x > 0 && y > 0     && (neigh[i - w - 1] & 4)) this._deformCell(x, y, x - 1, y - 1);
-      if (x > 0 && y + 1 < h && (neigh[i + w - 1] & 8)) this._deformCell(x, y, x - 1, y + 1);
+      const i = y * w + x, base = i * 8;
+      const c00 = y * CW + x, c10 = c00 + 1, c01 = c00 + CW, c11 = c01 + 1;
+      const t00 = ctype[c00] * 4, t10 = ctype[c10] * 4, t01 = ctype[c01] * 4, t11 = ctype[c11] * 4;
+      const a0 = 2 * c00 + E_SLOT[t00 + DOWN],  a1 = 2 * c00 + E_SLOT[t00 + RIGHT];
+      const b0 = 2 * c10 + E_SLOT[t10 + LEFT],  b1 = 2 * c10 + E_SLOT[t10 + DOWN];
+      const d0 = 2 * c11 + E_SLOT[t11 + UP],    d1 = 2 * c11 + E_SLOT[t11 + LEFT];
+      const e0 = 2 * c01 + E_SLOT[t01 + RIGHT], e1 = 2 * c01 + E_SLOT[t01 + UP];
+      let k = 0;
+      V[base] = a0;
+      if (a1 !== a0) { NB[base + k] = i - w - 1; V[base + ++k] = a1; }   // chamfer, NW neighbour
+      NB[base + k++] = y > 0 ? i - w : -1;                               // top side
+      V[base + k] = b0;
+      if (b1 !== b0) { NB[base + k] = i - w + 1; V[base + ++k] = b1; }   // chamfer, NE
+      NB[base + k++] = x < w - 1 ? i + 1 : -1;                           // right side
+      V[base + k] = d0;
+      if (d1 !== d0) { NB[base + k] = i + w + 1; V[base + ++k] = d1; }   // chamfer, SE
+      NB[base + k++] = y < h - 1 ? i + w : -1;                           // bottom side
+      V[base + k] = e0;
+      if (e1 !== e0) { NB[base + k] = i + w - 1; V[base + ++k] = e1; }   // chamfer, SW
+      NB[base + k++] = x > 0 ? i - 1 : -1;                               // left side
+      CN[i] = k;
     }
-    // Collapse valence-2 corner nodes. Preserve image corners.
-    const gw = this.gw;
-    const keep0 = 0,
-          keep1 = w * Q4,
-          keep2 = (h * Q4) * gw,
-          keep3 = keep2 + keep1;
-    const grid = this.grid;
-    const nbs = new Uint32Array(MAX_DEG);
-    // Walk the exists mask directly — much faster than a generator.
-    const exists = grid.exists, deg = grid.deg;
-    const cap = grid.capacity;
-    // Two-phase: collect nodes to collapse, then process. Collapsing can
-    // cascade, so we iterate to a fixed point.
-    const removals = [];
-    for (let node = 0; node < cap; node++) {
-      if (!exists[node]) continue;
-      if (node === keep0 || node === keep1 || node === keep2 || node === keep3) continue;
-      const d = deg[node];
-      if (d <= 2) {
-        if (d === 2) {
-          grid.neighborsInto(node, nbs);
-          grid.addEdge(nbs[0], nbs[1]);
-        }
-        removals.push(node);
-      }
-    }
-    for (let k = 0; k < removals.length; k++) grid.removeNode(removals[k]);
-    // Drop stale corner refs from pixel corner sets.
-    for (let i = 0; i < w * h; i++) {
-      if (this.cornerOver && this.cornerOver.has(i)) {
-        const s = this.cornerOver.get(i);
-        for (const c of s) if (!grid.hasNode(c)) s.delete(c);
-        continue;
-      }
-      const base = i * 8; let cnt = this.cornerCount[i];
-      for (let j = 0; j < cnt; ) {
-        if (!grid.hasNode(this.cornerBuf[base + j])) {
-          this.cornerBuf[base + j] = this.cornerBuf[base + cnt - 1];
-          cnt--;
-        } else j++;
-      }
-      this.cornerCount[i] = cnt;
-    }
-  }
-
-  // Chamfer the shared corner between pixel (x,y) and diagonal neighbor
-  // (nx,ny) in response to a blocking cardinal. Fully inlined for speed.
-  _deformCell(x, y, nx, ny) {
-    const { w, h, rgb, gw, cornerBuf, cornerCount } = this;
-    const grid = this.grid;
-    const gAdj = grid.adj, gDeg = grid.deg, gExi = grid.exists;
-
-    const px = Math.max(x, nx), py = Math.max(y, ny);
-    const ox = nx - x, oy = ny - y;
-    const Q2 = Q4 >> 1, Q1 = Q4 >> 2;
-    const pxQ = px * Q4, pyQ = py * Q4;
-    const pixnode = pyQ * gw + pxQ;
-    const me = y * w + x;
-    const meColor = rgb[me];
-
-    // --- horizontal cardinal at (nx, y) ------------------------------
-    if (nx >= 0 && nx < w) {
-      const adj = y * w + nx;
-      if (rgb[adj] !== meColor) {
-        const pn  = (pyQ - oy * Q4) * gw + pxQ;
-        const mpn = (pyQ - oy * Q2) * gw + pxQ;
-        const npn = (pyQ - oy * Q1) * gw + (pxQ + ox * Q1);
-        // corner ops on `adj`
-        if (this.cornerOver && this.cornerOver.has(adj)) {
-          const s = this.cornerOver.get(adj);
-          s.delete(pixnode); s.add(npn);
-        } else {
-          const base = adj * 8; let cnt = cornerCount[adj];
-          for (let j = 0; j < cnt; j++) if (cornerBuf[base + j] === pixnode) {
-            cornerBuf[base + j] = cornerBuf[base + cnt - 1];
-            cnt--; break;
-          }
-          // add npn if not present
-          let has = false;
-          for (let j = 0; j < cnt; j++) if (cornerBuf[base + j] === npn) { has = true; break; }
-          if (!has) {
-            if (cnt < 8) { cornerBuf[base + cnt++] = npn; }
-            else { this._spillAdd(adj, npn); }
-          }
-          cornerCount[adj] = cnt;
-        }
-        // corner ops on `me`: add npn if not present
-        if (this.cornerOver && this.cornerOver.has(me)) {
-          this.cornerOver.get(me).add(npn);
-        } else {
-          const base = me * 8; let cnt = cornerCount[me];
-          let has = false;
-          for (let j = 0; j < cnt; j++) if (cornerBuf[base + j] === npn) { has = true; break; }
-          if (!has) {
-            if (cnt < 8) { cornerBuf[base + cnt++] = npn; }
-            else { this._spillAdd(me, npn); }
-          }
-          cornerCount[me] = cnt;
-        }
-        // edge ops
-        this._deformEdgeInlined(pixnode, pn, mpn, npn);
-      }
-    }
-
-    // --- vertical cardinal at (x, ny) --------------------------------
-    if (ny >= 0 && ny < h) {
-      const adj = ny * w + x;
-      if (rgb[adj] !== meColor) {
-        const pn  = pyQ * gw + (pxQ - ox * Q4);
-        const mpn = pyQ * gw + (pxQ - ox * Q2);
-        const npn = (pyQ + oy * Q1) * gw + (pxQ - ox * Q1);
-        if (this.cornerOver && this.cornerOver.has(adj)) {
-          const s = this.cornerOver.get(adj);
-          s.delete(pixnode); s.add(npn);
-        } else {
-          const base = adj * 8; let cnt = cornerCount[adj];
-          for (let j = 0; j < cnt; j++) if (cornerBuf[base + j] === pixnode) {
-            cornerBuf[base + j] = cornerBuf[base + cnt - 1];
-            cnt--; break;
-          }
-          let has = false;
-          for (let j = 0; j < cnt; j++) if (cornerBuf[base + j] === npn) { has = true; break; }
-          if (!has) {
-            if (cnt < 8) { cornerBuf[base + cnt++] = npn; }
-            else { this._spillAdd(adj, npn); }
-          }
-          cornerCount[adj] = cnt;
-        }
-        if (this.cornerOver && this.cornerOver.has(me)) {
-          this.cornerOver.get(me).add(npn);
-        } else {
-          const base = me * 8; let cnt = cornerCount[me];
-          let has = false;
-          for (let j = 0; j < cnt; j++) if (cornerBuf[base + j] === npn) { has = true; break; }
-          if (!has) {
-            if (cnt < 8) { cornerBuf[base + cnt++] = npn; }
-            else { this._spillAdd(me, npn); }
-          }
-          cornerCount[me] = cnt;
-        }
-        this._deformEdgeInlined(pixnode, pn, mpn, npn);
-      }
-    }
-  }
-
-  // Fallback when a pixel exceeds 8 corners — spill to a Map<Set>.
-  _spillAdd(pi, k) {
-    if (!this.cornerOver) this.cornerOver = new Map();
-    let s = this.cornerOver.get(pi);
-    if (!s) {
-      s = new Set();
-      const base = pi * 8, n = this.cornerCount[pi];
-      for (let j = 0; j < n; j++) s.add(this.cornerBuf[base + j]);
-      this.cornerOver.set(pi, s);
-    }
-    s.add(k);
-  }
-
-  _deformEdgeInlined(pixnode, pn, mpn, npn) {
-    const grid = this.grid;
-    if (grid.exists[mpn]) {
-      grid.removeEdge(mpn, pixnode);
-    } else {
-      grid.removeEdge(pn, pixnode);
-      grid.addEdge(pn, mpn);
-    }
-    grid.addEdge(mpn, npn);
-    grid.addEdge(npn, pixnode);
-  }
-
-  // ==========================================================================
-  // Shapes (connected same-color pixels).
-  // ==========================================================================
-  _findShapes() {
-    const N = this.w * this.h;
-    const comp = new Int32Array(N); comp.fill(-1);
-    this.shapes = [];
-    const stack = new Int32Array(N);
-    const nbs   = new Int32Array(8);
+    // Twin slot of every interior cell edge (same edge, opposite direction).
+    const TW = this.cellTwin = new Int8Array(N * 8).fill(-1);
     for (let i = 0; i < N; i++) {
-      if (comp[i] !== -1) continue;
-      const id = this.shapes.length;
-      let sp = 0; stack[sp++] = i; comp[i] = id;
-      const pixels = [];
+      const base = i * 8, n = CN[i];
+      for (let k = 0; k < n; k++) {
+        const nb = NB[base + k];
+        if (nb < 0) continue;
+        const u = V[base + k], v = V[base + (k + 1 === n ? 0 : k + 1)];
+        const nbase = nb * 8, nn = CN[nb];
+        for (let t = 0; t < nn; t++) {
+          if (V[nbase + t] === v && V[nbase + (t + 1 === nn ? 0 : t + 1)] === u) { TW[base + k] = t; break; }
+        }
+        if (TW[base + k] < 0) throw new Error('depixelize: inconsistent cell graph');
+      }
+    }
+  }
+
+  // ---- regions -----------------------------------------------------------------
+  _components(exact) {
+    const N = this.N, key = this.key;
+    const comp = new Int32Array(N).fill(-1), stack = new Int32Array(N), nbs = new Int32Array(8);
+    const sizes = [], first = [];
+    let id = 0;
+    for (let i = 0; i < N; i++) {
+      if (comp[i] >= 0) continue;
+      const ki = key[i];
+      let sp = 0, size = 0;
+      stack[sp++] = i; comp[i] = id;
       while (sp) {
         const n = stack[--sp];
-        pixels.push(n);
+        size++;
         const nc = this.pxNeighbors(n, nbs);
         for (let k = 0; k < nc; k++) {
           const m = nbs[k];
-          if (comp[m] === -1) { comp[m] = id; stack[sp++] = m; }
+          if (comp[m] < 0 && (!exact || key[m] === ki)) { comp[m] = id; stack[sp++] = m; }
         }
       }
-      this.shapes.push({ id, color: this.rgb[pixels[0]], pixels, outer: null, holes: [] });
+      sizes.push(size); first.push(i); id++;
     }
-    this.pixelShape = comp;
+    return { comp, count: id, sizes, first };
   }
 
-  // ==========================================================================
-  // Outline graph = grid minus intra-shape edges.
-  // Optimization: build outline by copying grid then removing intra-shape
-  // boundary edges. Inner loop uses a small Uint8 lookup keyed by corner
-  // value (cap-sized; reset via bumping a version).
-  // ==========================================================================
-  _findOutlines() {
-    this.outline = this.grid.copy();
-    const N = this.w * this.h;
-    const outline = this.outline;
-    const nbs = new Int32Array(8);
-    const ci  = new Uint32Array(16);
-    // Lazy-initialized shared marker sized to grid capacity.
-    if (!this._cornerMark || this._cornerMark.length < outline.capacity) {
-      this._cornerMark = new Uint32Array(outline.capacity);
+  // Noise suppression (auto/cell): tiny groups of pixels whose colour is only
+  // slightly off from an edge-adjacent group are merged into it, so they are
+  // shaded smoothly instead of becoming isolated cells. Real pixel-art
+  // features (an eye, a highlight) are far more distinct and are kept.
+  _absorbFragments(sim) {
+    const N = this.N, comp = sim.comp, NB = this.cellNb, CN = this.cellN;
+    const parent = new Int32Array(sim.count);
+    for (let c = 0; c < sim.count; c++) parent[c] = c;
+    const find = c => { while (parent[c] !== c) c = parent[c] = parent[parent[c]]; return c; };
+    const size = new Int32Array(sim.count);
+    for (let c = 0; c < sim.count; c++) size[c] = sim.sizes[c];
+    const members = [];   // pixels of the current small groups, per root
+    for (let pass = 0; pass < 4; pass++) {
+      const bestD = new Float64Array(sim.count).fill(Infinity), bestC = new Int32Array(sim.count).fill(-1);
+      let any = false;
+      for (let i = 0; i < N; i++) {
+        const c = find(comp[i]);
+        if (size[c] > FRAGMENT) continue;
+        for (let k = 0, base = i * 8; k < CN[i]; k++) {
+          const nb = NB[base + k];
+          if (nb < 0) continue;
+          const o = find(comp[nb]);
+          if (o === c) continue;
+          const d = this.yuvDist(i, nb);
+          if (d < bestD[c] || (d === bestD[c] && size[o] > size[bestC[c]])) { bestD[c] = d; bestC[c] = o; }
+        }
+      }
+      for (let c = 0; c < sim.count; c++) {
+        if (parent[c] !== c || size[c] > FRAGMENT || bestC[c] < 0 || bestD[c] > ABSORB_DIST) continue;
+        const o = find(bestC[c]);
+        if (o === c) continue;
+        parent[c] = o; size[o] += size[c]; any = true;
+      }
+      if (!any) break;
     }
-    const mark = this._cornerMark;
-    let mver = this._cornerVer | 0;
-
+    const map = new Int32Array(sim.count).fill(-1), out = new Int32Array(N), sizes = [], first = [];
+    let n = 0;
     for (let i = 0; i < N; i++) {
-      const ncount = this.pxNeighbors(i, nbs);
-      if (ncount === 0) continue;
-      // Mark corners of i with a fresh version.
-      mver++;
-      const ciCount = this.cornersArray(i, ci);
-      for (let p = 0; p < ciCount; p++) mark[ci[p]] = mver;
-
-      for (let k = 0; k < ncount; k++) {
-        const j = nbs[k];
-        if (j < i) continue;
-        // Walk corners of j, find the (up to 2) that are also marked.
-        // Using the fast Uint32 lookup path directly avoids calling cornersArray(j).
-        let a = -1, b = -1;
-        if (this.cornerOver && this.cornerOver.has(j)) {
-          for (const c of this.cornerOver.get(j)) {
-            if (mark[c] === mver) {
-              if (a === -1) a = c; else { b = c; break; }
-            }
-          }
-        } else {
-          const base = j * 8, cnt = this.cornerCount[j];
-          for (let q = 0; q < cnt; q++) {
-            const c = this.cornerBuf[base + q];
-            if (mark[c] === mver) {
-              if (a === -1) a = c; else { b = c; break; }
-            }
-          }
-        }
-        if (b !== -1 && outline.hasEdge(a, b)) outline.removeEdge(a, b);
-      }
+      const r = find(comp[i]);
+      if (map[r] < 0) { map[r] = n++; sizes.push(0); first.push(i); }
+      out[i] = map[r]; sizes[map[r]]++;
     }
-    this._cornerVer = mver;
+    return { comp: out, count: n, sizes, first };
   }
 
-  // ==========================================================================
-  // Per-shape boundary paths + spline fit. Each shape gets its induced
-  // subgraph on the outline graph; components become closed curves.
-  // Optimization: instead of Set<cornerKey> and Map<cornerKey, array[]> per
-  // shape, we use a global Uint8Array mask + per-corner neighbor lists
-  // reused across shapes. The induced-subgraph calculation becomes a couple
-  // of tight typed-array loops.
-  // ==========================================================================
-  _assignPaths() {
-    this.paths = [];
-    const pathIndex = new Map();
-    const gw = this.gw;
-    const outline = this.outline;
-    const cap = outline.capacity;
-    const cBuf = new Uint32Array(16);
-    // Persistent per-corner mask of "is in current shape's corner set"
-    // Bumped version per shape lets us avoid clearing between shapes.
-    const inShape = new Uint32Array(cap);
-    let shapeVer = 0;
-
-    // Scratch: flat representation of this shape's corner list + induced
-    // adjacency as per-corner arrays. Grow on demand.
-    let shapeCorners = new Uint32Array(128);
-    let inducedAdj = new Uint32Array(128 * MAX_DEG);
-    let inducedDeg = new Uint8Array(128);
-
-    // BFS scratch
-    const visited = new Uint32Array(cap);      // 0 if unvisited in this shape, shapeVer if visited
-    let visitVer = 0;
-    const stack = new Int32Array(cap);
-
-    for (const shape of this.shapes) {
-      // Render threshold: shapes below MIN_SMOOTH_PIXELS are painted only by
-      // the NN backdrop in the SVG, so we don't need paths for them. Skip.
-      if (shape.pixels.length < 4) continue;
-      shapeVer++;
-      // Collect on-outline corners for this shape into shapeCorners[].
-      let cn = 0;
-      for (let pk = 0; pk < shape.pixels.length; pk++) {
-        const pi = shape.pixels[pk];
-        const k = this.cornersArray(pi, cBuf);
-        for (let j = 0; j < k; j++) {
-          const c = cBuf[j];
-          if (outline.exists[c] && inShape[c] !== shapeVer) {
-            inShape[c] = shapeVer;
-            if (cn >= shapeCorners.length) {
-              const nb = new Uint32Array(shapeCorners.length * 2);
-              nb.set(shapeCorners); shapeCorners = nb;
-            }
-            shapeCorners[cn++] = c;
-          }
-        }
-      }
-      if (cn < 3) continue;
-
-      // Build induced adjacency. For each corner c in shapeCorners, filter
-      // its outline neighbors to those also in inShape. Store neighbors as
-      // LOCAL INDEX into shapeCorners[] (so subsequent ops work in a dense
-      // 0..cn-1 index space rather than sparse corner keys).
-      // Growth of induced arrays to match cn.
-      if (cn > inducedDeg.length) {
-        let cap2 = inducedDeg.length; while (cap2 < cn) cap2 *= 2;
-        inducedAdj = new Uint32Array(cap2 * MAX_DEG);
-        inducedDeg = new Uint8Array(cap2);
+  _buildRegions(mode) {
+    const N = this.N;
+    const sim = mode === 'shape' ? null : this._absorbFragments(this._components(false));
+    let region, count;
+    if (mode === 'cell') {
+      region = sim.comp; count = sim.count;
+    } else {
+      const ex = this._components(true);
+      if (mode === 'shape') {
+        region = ex.comp; count = ex.count;
       } else {
-        for (let i = 0; i < cn; i++) inducedDeg[i] = 0;
+        // auto: a group of similar pixels stays one smoothly shaded region
+        // unless it is made of large flat patches (banded shading), in which
+        // case each patch gets its own crisp outline.
+        const S = sim.count, K = new Int32Array(S), parts = new Int32Array(S), small = new Int32Array(S);
+        for (let i = 0; i < N; i++) K[sim.comp[i]]++;
+        for (let e = 0; e < ex.count; e++) {
+          const s = sim.comp[ex.first[e]];
+          parts[s]++;
+          if (ex.sizes[e] < 3) small[s] += ex.sizes[e];
+        }
+        region = new Int32Array(N);
+        for (let i = 0; i < N; i++) {
+          const s = sim.comp[i];
+          const crisp = parts[s] === 1 || (K[s] >= 4 * parts[s] && small[s] * 4 <= K[s]);
+          region[i] = crisp ? ex.comp[i] : ex.count + s;
+        }
+        count = ex.count + S;
       }
-      // Map corner key -> local index: reuse the `inShape` array by writing
-      // the local index +1 there (we already know c is in shape because
-      // inShape[c] === shapeVer; store (shapeVer << 16) | (localIdx+1)).
-      // Simpler: use a separate Int32Array keyed by corner.
-      // We'll just reuse the visited buffer — it's safe since shapeVer !== visitVer yet.
-      // Local mapping: cornerKey -> local index in [1..cn]
-      for (let i = 0; i < cn; i++) localIdxMap[shapeCorners[i]] = i + 1;
-
-      const adjBuf = outline.adj, degBuf = outline.deg;
-      let lexMin = shapeCorners[0], lexMinX = lexMin % gw, lexMinY = (lexMin / gw) | 0;
-      for (let i = 1; i < cn; i++) {
-        const c = shapeCorners[i];
-        const cx = c % gw, cy = (c / gw) | 0;
-        if (cx < lexMinX || (cx === lexMinX && cy < lexMinY)) { lexMin = c; lexMinX = cx; lexMinY = cy; }
+    }
+    const map = new Int32Array(count).fill(-1);
+    let R = 0;
+    for (let i = 0; i < N; i++) if (map[region[i]] < 0) map[region[i]] = R++;
+    const reg = this.region = new Int32Array(N);
+    for (let i = 0; i < N; i++) reg[i] = map[region[i]];
+    this.R = R;
+    const start = this.rStart = new Int32Array(R + 1);
+    for (let i = 0; i < N; i++) start[reg[i] + 1]++;
+    for (let r = 0; r < R; r++) start[r + 1] += start[r];
+    const pix = this.rPix = new Int32Array(N), fill = start.slice(0, R);
+    for (let i = 0; i < N; i++) pix[fill[reg[i]]++] = i;
+    const multi = this.rMulti = new Uint8Array(R);
+    const kind = this.rKind = new Uint8Array(R);      // 0 opaque, 1 translucent, 2 transparent
+    const key = this.key, alpha = this.alpha;
+    for (let r = 0; r < R; r++) {
+      const k0 = key[pix[start[r]]];
+      let m = 0, minA = 255;
+      for (let p = start[r]; p < start[r + 1]; p++) {
+        const i = pix[p];
+        if (key[i] !== k0) m = 1;
+        if (alpha[i] < minA) minA = alpha[i];
       }
-      const lexMinLocal = localIdxMap[lexMin] - 1;
+      multi[r] = m;
+      kind[r] = minA === 0 ? 2 : minA < 255 ? 1 : 0;
+    }
+  }
 
-      // Build induced adjacency in local indices.
-      for (let i = 0; i < cn; i++) {
-        const c = shapeCorners[i];
-        const base = c * MAX_DEG, d = degBuf[c];
-        const iBase = i * MAX_DEG;
-        let ld = 0;
-        for (let k = 0; k < d; k++) {
-          const m = adjBuf[base + k];
-          const li = localIdxMap[m];
-          if (li !== 0) {
-            // localIdxMap only holds current shape's corners (we wrote it
-            // above; other shapes' writes are stale but collide — we have
-            // to validate via inShape[]).
-            if (inShape[m] === shapeVer) {
-              inducedAdj[iBase + ld++] = li - 1;
-            }
+  // ---- visible edges -------------------------------------------------------------
+  _buildBoundaries() {
+    const N = this.N, V = this.cellV, NB = this.cellNb, CN = this.cellN, TW = this.cellTwin, reg = this.region;
+    const edgeOf = this.edgeOf = new Int32Array(N * 8).fill(-1);
+    let cap = 256, E = 0;
+    let eU = new Int32Array(cap), eV = new Int32Array(cap), eP = new Int32Array(cap), eQ = new Int32Array(cap);
+    for (let i = 0; i < N; i++) {
+      const base = i * 8, n = CN[i], ri = reg[i];
+      for (let k = 0; k < n; k++) {
+        const s = base + k;
+        if (edgeOf[s] >= 0) continue;
+        const nb = NB[s];
+        if (nb >= 0 && reg[nb] === ri) continue;
+        if (E === cap) { cap *= 2; eU = grow(eU, cap); eV = grow(eV, cap); eP = grow(eP, cap); eQ = grow(eQ, cap); }
+        eU[E] = V[s]; eV[E] = V[base + (k + 1 === n ? 0 : k + 1)]; eP[E] = i; eQ[E] = nb;
+        edgeOf[s] = E;
+        if (nb >= 0) edgeOf[nb * 8 + TW[s]] = E;
+        E++;
+      }
+    }
+    this.E = E; this.eU = eU; this.eV = eV; this.eP = eP; this.eQ = eQ;
+    const NN = this.nodeCount;
+    const deg = this.bdeg = new Uint8Array(NN);
+    for (let e = 0; e < E; e++) { deg[eU[e]]++; deg[eV[e]]++; }
+    const st = this.bStart = new Int32Array(NN + 1);
+    for (let v = 0; v < NN; v++) st[v + 1] = st[v] + deg[v];
+    const inc = this.bInc = new Int32Array(2 * E), fp = st.slice(0, NN);
+    for (let e = 0; e < E; e++) { inc[fp[eU[e]]++] = e; inc[fp[eV[e]]++] = e; }
+  }
+
+  // Next visible half-edge after half-edge s (slot = pixel * 8 + k) along the
+  // boundary of s's region: rotate around the end vertex through the region's
+  // own cells until a visible edge is found.
+  _nextBoundary(s) {
+    const NB = this.cellNb, CN = this.cellN, TW = this.cellTwin, EO = this.edgeOf;
+    let p = s >> 3, q = (s & 7) + 1;
+    if (q === CN[p]) q = 0;
+    for (let guard = 0; guard < 32; guard++) {
+      const t = (p << 3) + q;
+      if (EO[t] >= 0) return t;
+      const tw = TW[t];
+      p = NB[t]; q = tw + 1;
+      if (q === CN[p]) q = 0;
+    }
+    throw new Error('depixelize: boundary rotation failed');
+  }
+
+  _traceLoops() {
+    const N = this.N, V = this.cellV, CN = this.cellN, EO = this.edgeOf, X = this.nodeX, Y = this.nodeY;
+    const reg = this.region, R = this.R;
+    const seen = new Uint8Array(N * 8);
+    const loops = this.loops = [];
+    const rLoops = this.rLoops = new Array(R);
+    for (let r = 0; r < R; r++) rLoops[r] = [];
+    const tmp = [], limit = 2 * this.E + 8;
+    for (let i = 0; i < N; i++) {
+      const n = CN[i];
+      for (let k = 0; k < n; k++) {
+        const s0 = i * 8 + k;
+        if (EO[s0] < 0 || seen[s0]) continue;
+        tmp.length = 0;
+        let area = 0, s = s0, guard = 0;
+        do {
+          seen[s] = 1; tmp.push(s);
+          const p = s >> 3, q = s & 7;
+          const v0 = V[s], v1 = V[(p << 3) + (q + 1 === CN[p] ? 0 : q + 1)];
+          area += X[v0] * Y[v1] - X[v1] * Y[v0];
+          s = this._nextBoundary(s);
+          if (++guard > limit) throw new Error('depixelize: boundary trace failed');
+        } while (s !== s0);
+        rLoops[reg[i]].push(loops.length);
+        loops.push({ region: reg[i], slots: Int32Array.from(tmp), area: area / 32 });  // px²
+      }
+    }
+    // Outer area of each region (sum of its positive loops) for paint order.
+    const rArea = this.rArea = new Float64Array(R);
+    for (const L of loops) if (L.area > 0) rArea[L.region] += L.area;
+  }
+
+  // ---- curves (paper §3.3) --------------------------------------------------------
+  _isShading(e) {
+    const q = this.eQ[e];
+    return q >= 0 && this.yuvDist(this.eP[e], q) <= SHADING_DIST ? 1 : 0;
+  }
+
+  // Direction leaving v along visible edge e, looking up to two edges ahead.
+  _dirFrom(v, e, D, o) {
+    const eU = this.eU, eV = this.eV, X = this.nodeX, Y = this.nodeY;
+    const u = eU[e] === v ? eV[e] : eU[e];
+    let tx = X[u], ty = Y[u];
+    if (this.bdeg[u] === 2) {
+      const s = this.bStart[u], a = this.bInc[s], e2 = a === e ? this.bInc[s + 1] : a;
+      const u2 = eU[e2] === u ? eV[e2] : eU[e2];
+      tx = X[u2]; ty = Y[u2];
+    }
+    D[o] = tx - X[v]; D[o + 1] = ty - Y[v];
+  }
+
+  _buildCurves() {
+    const E = this.E, eU = this.eU, eV = this.eV, eQ = this.eQ;
+    const NN = this.nodeCount, deg = this.bdeg, st = this.bStart, inc = this.bInc;
+    const X = this.nodeX, Y = this.nodeY;
+
+    // T-junctions: at every 3-way junction pick the two edges that continue.
+    const j1 = this.join1 = new Int32Array(NN).fill(-1);
+    const j2 = this.join2 = new Int32Array(NN).fill(-1);
+    const D = new Float64Array(6);
+    const cos2 = (a, b) => (D[a] * D[b] + D[a + 1] * D[b + 1]) /
+      Math.sqrt((D[a] * D[a] + D[a + 1] * D[a + 1]) * (D[b] * D[b] + D[b + 1] * D[b + 1]) || 1);
+    for (let v = 0; v < NN; v++) {
+      if (deg[v] !== 3) continue;
+      const s = st[v], ea = inc[s], eb = inc[s + 1], ec = inc[s + 2];
+      const ba = eQ[ea] < 0, bb = eQ[eb] < 0, bc = eQ[ec] < 0;
+      let p, q;
+      if (ba || bb || bc) {                           // the image frame continues
+        if (ba && bb) { p = ea; q = eb; } else if (ba && bc) { p = ea; q = ec; } else { p = eb; q = ec; }
+      } else {
+        const sa = this._isShading(ea), sb = this._isShading(eb), sc = this._isShading(ec);
+        if (sa + sb + sc === 1) {                     // contour edges continue through
+          if (sa) { p = eb; q = ec; } else if (sb) { p = ea; q = ec; } else { p = ea; q = eb; }
+        } else {                                      // straightest pair continues
+          this._dirFrom(v, ea, D, 0); this._dirFrom(v, eb, D, 2); this._dirFrom(v, ec, D, 4);
+          const cab = cos2(0, 2), cac = cos2(0, 4), cbc = cos2(2, 4);
+          if (cab <= cac && cab <= cbc) { p = ea; q = eb; }
+          else if (cac <= cbc) { p = ea; q = ec; }
+          else { p = eb; q = ec; }
+        }
+      }
+      j1[v] = p; j2[v] = q;
+    }
+
+    const curveOf = this.curveOf = new Int32Array(E).fill(-1);
+    const idxOf = this.idxOf = new Int32Array(E);
+    const curves = this.curves = [];
+    const terminal = (v, e) => deg[v] !== 2 && j1[v] !== e && j2[v] !== e;
+    const nextEdge = (v, e) => {
+      if (deg[v] === 2) { const a = inc[st[v]]; return a === e ? inc[st[v] + 1] : a; }
+      return j1[v] === e ? j2[v] : j2[v] === e ? j1[v] : -1;
+    };
+    const nodes = [], edges = [];
+    const make = (v0, e0, closed) => {
+      nodes.length = 0; edges.length = 0;
+      const id = curves.length;
+      let v = v0, e = e0;
+      nodes.push(v0);
+      for (;;) {
+        const u = eU[e] === v ? eV[e] : eU[e];
+        curveOf[e] = id; idxOf[e] = edges.length; edges.push(e);
+        if (closed) {
+          const ne = nextEdge(u, e);
+          if (ne === e0) break;
+          nodes.push(u);
+          if (ne < 0 || curveOf[ne] >= 0) { closed = false; break; }   // defensive
+          v = u; e = ne;
+        } else {
+          nodes.push(u);
+          if (terminal(u, e)) break;
+          const ne = nextEdge(u, e);
+          if (ne < 0 || curveOf[ne] >= 0) break;
+          v = u; e = ne;
+        }
+      }
+      const M = nodes.length;
+      const c = {
+        id, closed, border: eQ[edges[0]] < 0, n: edges.length,
+        nodes: Int32Array.from(nodes), edges: Int32Array.from(edges),
+        x: new Float64Array(M), y: new Float64Array(M),
+        ox: null, oy: null, excl: null,
+        att0: -1, att0j: 0, att1: -1, att1j: 0,
+      };
+      for (let k = 0; k < M; k++) { c.x[k] = X[nodes[k]] * 0.25; c.y[k] = Y[nodes[k]] * 0.25; }
+      c.ox = c.x.slice(); c.oy = c.y.slice();
+      curves.push(c);
+    };
+    for (let v = 0; v < NN; v++) {
+      const d = deg[v];
+      if (d === 0 || d === 2) continue;
+      for (let k = st[v]; k < st[v + 1]; k++) {
+        const e = inc[k];
+        if (curveOf[e] < 0 && terminal(v, e)) make(v, e, false);
+      }
+    }
+    for (let e = 0; e < E; e++) if (curveOf[e] < 0) make(eU[e], e, true);
+
+    // A curve that ends on a T-junction is attached to the curve passing
+    // through it, so that its end follows that curve exactly.
+    this.attached = [];
+    for (const c of curves) {
+      if (c.closed || c.border) continue;
+      for (let end = 0; end < 2; end++) {
+        const v = end ? c.nodes[c.n] : c.nodes[0];
+        if (deg[v] !== 3 || j1[v] < 0) continue;
+        const e = end ? c.edges[c.n - 1] : c.edges[0];
+        if (e === j1[v] || e === j2[v]) continue;
+        const h = curves[curveOf[j1[v]]];
+        if (h.border) continue;
+        const je = idxOf[j1[v]];
+        let jn = h.nodes[je] === v ? je : je + 1;
+        if (h.closed && jn === h.n) jn = 0;
+        if (end) { c.att1 = h.id; c.att1j = jn; } else { c.att0 = h.id; c.att0j = jn; }
+      }
+      if (c.att0 >= 0 || c.att1 >= 0) this.attached.push(c);
+    }
+  }
+
+  _detectCorners() {
+    const X = this.nodeX, Y = this.nodeY;
+    for (const c of this.curves) {
+      if (c.border) continue;
+      const nodes = c.nodes, M = nodes.length, closed = c.closed;
+      const ex = c.excl = new Uint8Array(M);
+      for (let pi = 0; pi < CORNER_PATTERNS.length; pi++) {
+        const pat = CORNER_PATTERNS[pi], L = pat.length >> 1;
+        if (L > M) continue;
+        const sEnd = closed ? M : M - L + 1;
+        for (let s = 0; s < sEnd; s++) {
+          const n0 = nodes[s], ox = X[n0] - pat[0], oy = Y[n0] - pat[1];
+          if ((ox & 3) !== 0 || (oy & 3) !== 0) continue;
+          let k = 1;
+          for (; k < L; k++) {
+            let idx = s + k; if (idx >= M) idx -= M;
+            const nk = nodes[idx];
+            if (X[nk] - pat[2 * k] !== ox || Y[nk] - pat[2 * k + 1] !== oy) break;
           }
+          if (k === L) for (let t = 1; t < L - 1; t++) { let idx = s + t; if (idx >= M) idx -= M; ex[idx] = 1; }
         }
-        inducedDeg[i] = ld;
       }
+    }
+  }
 
-      // Clear the localIdxMap slots we wrote (must not leak to next shape).
-      for (let i = 0; i < cn; i++) localIdxMap[shapeCorners[i]] = 0;
-
-      // Connected components in induced graph, via BFS on local indices.
-      visitVer++;
-      for (let seed = 0; seed < cn; seed++) {
-        if (visited[seed] === visitVer) continue;
-        // Collect component; track whether it contains lexMinLocal.
-        let sp = 0;
-        stack[sp++] = seed;
-        visited[seed] = visitVer;
-        const compStart = sp === 1 ? 0 : 0;
-        // Use a simple JS array for comp (rarely > 100 nodes, allocator OK).
-        const comp = [seed];
-        let hasLex = (seed === lexMinLocal);
-        while (sp) {
-          const n = stack[--sp];
-          const base = n * MAX_DEG, d = inducedDeg[n];
-          for (let k = 0; k < d; k++) {
-            const m = inducedAdj[base + k];
-            if (visited[m] !== visitVer) {
-              visited[m] = visitVer;
-              stack[sp++] = m;
-              comp.push(m);
-              if (m === lexMinLocal) hasLex = true;
-            }
+  // ---- optimisation (paper §3.4) -----------------------------------------------------
+  optimize(o) {
+    const iters = Math.max(0, o.iterations | 0), guesses = Math.max(0, o.guesses | 0), off = +o.guessOffset;
+    if (!iters || !guesses || !(off > 0)) return;
+    const rand = mulberry32(o.seed | 0);
+    const live = this.curves.filter(c => !c.border && (c.closed ? c.n >= 3 : c.n >= 2));
+    for (let it = 0; it < iters; it++) {
+      this._updateAttachments();
+      for (let ci = 0; ci < live.length; ci++) {
+        const c = live[ci], x = c.x, y = c.y, lo = c.closed ? 0 : 1, hi = c.n - 1;
+        for (let i = lo; i <= hi; i++) {
+          const x0 = x[i], y0 = y[i];
+          let best = nodeEnergy(c, i), bx = x0, by = y0;
+          for (let g = 0; g < guesses; g++) {
+            const r = rand() * off, th = rand() * TWO_PI;
+            x[i] = x0 + r * Math.cos(th); y[i] = y0 + r * Math.sin(th);
+            const e = nodeEnergy(c, i);
+            if (e < best) { best = e; bx = x[i]; by = y[i]; }
           }
+          x[i] = bx; y[i] = by;
         }
-        if (comp.length < 3) continue;
-
-        // Dedup paths by sorted-corner-key signature. Build the signature
-        // and the key inline.
-        const compKeys = new Uint32Array(comp.length);
-        for (let i = 0; i < comp.length; i++) compKeys[i] = shapeCorners[comp[i]];
-        compKeys.sort();
-        let keyStr = '';
-        for (let i = 0; i < compKeys.length; i++) keyStr += compKeys[i] + ',';
-
-        let path = pathIndex.get(keyStr);
-        if (!path) {
-          const nodes = tracePathLocal(inducedAdj, inducedDeg, comp, shapeCorners, gw);
-          if (nodes.length < 3) continue;
-          path = new Path(nodes, gw);
-          pathIndex.set(keyStr, path);
-          this.paths.push(path);
-        }
-        if (hasLex) shape.outer = path; else shape.holes.push(path);
-        path.shapes.add(shape);
       }
     }
   }
-}
 
-// Global scratch for corner-key → local-index mapping during _assignPaths.
-// Sized once to the grid capacity lazily; reset between shapes via clearing.
-let localIdxMap = new Int32Array(0);
-
-// ============================================================================
-// FixedGraph — dense fixed-slot adjacency for integer-keyed nodes with
-// bounded degree (≤ MAX_DEG). Zero-alloc for all ops. Replaces the former
-// Map<int, Set<int>> SparseGraph. Nodes are indexed in [0, capacity).
-//
-//   exists[n]              1 byte: 1 if node n is present
-//   adj[n * MAX_DEG + s]   4 bytes: neighbor key, or EMPTY = 0xFFFFFFFF
-//   deg[n]                 1 byte: current degree of n
-//
-// All three arrays are TypedArrays — memory-packed, cache-friendly.
-// ============================================================================
-const EMPTY   = 0xFFFFFFFF;
-const MAX_DEG = 8;               // max degree observed on the quarter-pixel grid
-
-class FixedGraph {
-  constructor(capacity) {
-    this.capacity = capacity;
-    this.exists = new Uint8Array(capacity);
-    this.deg    = new Uint8Array(capacity);
-    this.adj    = new Uint32Array(capacity * MAX_DEG);
-    this.adj.fill(EMPTY);
-  }
-  addNode(n)      { this.exists[n] = 1; }
-  hasNode(n)      { return this.exists[n] === 1; }
-  removeNode(n) {
-    if (!this.exists[n]) return;
-    const base = n * MAX_DEG, d = this.deg[n];
-    for (let i = 0; i < d; i++) {
-      const m = this.adj[base + i];
-      if (m === EMPTY) continue;
-      // Remove back-edge m → n
-      const mb = m * MAX_DEG, md = this.deg[m];
-      for (let j = 0; j < md; j++) if (this.adj[mb + j] === n) {
-        this.adj[mb + j] = this.adj[mb + md - 1];
-        this.adj[mb + md - 1] = EMPTY;
-        this.deg[m] = md - 1;
-        break;
+  _updateAttachments() {
+    const C = this.curves, T = _T;
+    let delta = 0;
+    for (const c of this.attached) {
+      if (c.att0 >= 0) {
+        nodePt(C[c.att0], c.att0j, T);
+        delta = Math.max(delta, Math.abs(T[0] - c.x[0]) + Math.abs(T[1] - c.y[0]));
+        c.x[0] = T[0]; c.y[0] = T[1];
       }
-      this.adj[base + i] = EMPTY;
-    }
-    this.deg[n] = 0;
-    this.exists[n] = 0;
-  }
-  addEdge(a, b) {
-    this.exists[a] = 1; this.exists[b] = 1;
-    if (!this._hasNeighbor(a, b)) {
-      this.adj[a * MAX_DEG + this.deg[a]++] = b;
-      this.adj[b * MAX_DEG + this.deg[b]++] = a;
-    }
-  }
-  hasEdge(a, b) { return this.exists[a] === 1 && this._hasNeighbor(a, b); }
-  removeEdge(a, b) {
-    this._removeOne(a, b);
-    this._removeOne(b, a);
-  }
-  _hasNeighbor(n, m) {
-    const base = n * MAX_DEG, d = this.deg[n];
-    for (let i = 0; i < d; i++) if (this.adj[base + i] === m) return true;
-    return false;
-  }
-  _removeOne(n, m) {
-    const base = n * MAX_DEG, d = this.deg[n];
-    for (let i = 0; i < d; i++) if (this.adj[base + i] === m) {
-      this.adj[base + i] = this.adj[base + d - 1];
-      this.adj[base + d - 1] = EMPTY;
-      this.deg[n] = d - 1;
-      return;
-    }
-  }
-  degreeOf(n)   { return this.deg[n]; }
-  // Write neighbors of n into out[]; return count.
-  neighborsInto(n, out) {
-    const base = n * MAX_DEG, d = this.deg[n];
-    for (let i = 0; i < d; i++) out[i] = this.adj[base + i];
-    return d;
-  }
-  // Iterate with a callback — no allocation.
-  forEachNeighbor(n, fn) {
-    const base = n * MAX_DEG, d = this.deg[n];
-    for (let i = 0; i < d; i++) fn(this.adj[base + i]);
-  }
-  // Iterate all existing nodes into an out array; return count.
-  // Typically called once per pass in non-hot code.
-  *nodes() {
-    const e = this.exists;
-    for (let i = 0; i < this.capacity; i++) if (e[i]) yield i;
-  }
-  copy() {
-    const g = new FixedGraph(this.capacity);
-    g.exists.set(this.exists);
-    g.deg.set(this.deg);
-    g.adj.set(this.adj);
-    return g;
-  }
-}
-
-// ============================================================================
-// Planar-face trace (local-index variant for _assignPaths).
-// inducedAdj/Deg are stride-MAX_DEG arrays indexed by local node index
-// (0..cn-1). shapeCorners maps local index → corner key (needed for the
-// lex-min start selection and the final coordinate conversion).
-// Returns an array of corner keys (not local indices).
-// ============================================================================
-function tracePathLocal(inducedAdj, inducedDeg, comp, shapeCorners, gw) {
-  // Lex-min start among this component's LOCAL indices.
-  let startLocal = comp[0];
-  let startKey = shapeCorners[startLocal];
-  let startX = startKey % gw, startY = (startKey / gw) | 0;
-  for (let i = 1; i < comp.length; i++) {
-    const lc = comp[i];
-    const k = shapeCorners[lc];
-    const cx = k % gw, cy = (k / gw) | 0;
-    if (cx < startX || (cx === startX && cy < startY)) {
-      startLocal = lc; startKey = k; startX = cx; startY = cy;
-    }
-  }
-  const d0 = inducedDeg[startLocal];
-  if (d0 === 0) return [startKey];
-  const base0 = startLocal * MAX_DEG;
-  // Pick neighbor with smallest slope.
-  let firstLocal = inducedAdj[base0];
-  {
-    let firstKey = shapeCorners[firstLocal];
-    let bestSlope = slopeIntKeys(startX, startY, firstKey, gw);
-    for (let i = 1; i < d0; i++) {
-      const lc = inducedAdj[base0 + i];
-      const k = shapeCorners[lc];
-      const s = slopeIntKeys(startX, startY, k, gw);
-      if (s < bestSlope) { bestSlope = s; firstLocal = lc; firstKey = k; }
-    }
-  }
-  const out = [startKey];
-  let prev = startLocal, curr = firstLocal;
-  const maxSteps = comp.length * 4 + 10;
-  for (let step = 0; step < maxSteps; step++) {
-    out.push(shapeCorners[curr]);
-    const d = inducedDeg[curr];
-    if (d === 0) break;
-    const next = pickMostCWLocal(prev, curr, inducedAdj, d, shapeCorners, gw);
-    if (next === -1) break;
-    if (curr === startLocal && next === firstLocal) break;
-    prev = curr; curr = next;
-  }
-  if (out.length > 1 && out[out.length - 1] === startKey) out.pop();
-  return out;
-}
-function slopeIntKeys(x0, y0, nKey, gw) {
-  const x1 = nKey % gw, y1 = (nKey / gw) | 0;
-  const dx = x1 - x0, dy = y1 - y0;
-  return dx === 0 ? dy * 1e14 : dy / dx;
-}
-const PI2 = Math.PI * 2;
-function pickMostCWLocal(prevLocal, currLocal, inducedAdj, d, shapeCorners, gw) {
-  const currKey = shapeCorners[currLocal], prevKey = shapeCorners[prevLocal];
-  const cx = currKey % gw, cy = (currKey / gw) | 0;
-  const px = prevKey % gw, py = (prevKey / gw) | 0;
-  const inAng = Math.atan2(py - cy, px - cx);
-  const base = currLocal * MAX_DEG;
-  let bestLocal = -1, bestTurn = Infinity;
-  for (let k = 0; k < d; k++) {
-    const nLocal = inducedAdj[base + k];
-    if (nLocal === prevLocal && d > 1) continue;
-    const nKey = shapeCorners[nLocal];
-    const nx = nKey % gw, ny = (nKey / gw) | 0;
-    let turn = inAng - Math.atan2(ny - cy, nx - cx);
-    while (turn <    0) turn += PI2;
-    while (turn >= PI2) turn -= PI2;
-    if (turn < bestTurn) { bestTurn = turn; bestLocal = nLocal; }
-  }
-  if (bestLocal === -1 && d === 1) bestLocal = inducedAdj[base];
-  return bestLocal;
-}
-
-// ============================================================================
-// Path — boundary polyline + its quadratic B-spline fit.
-// ============================================================================
-class Path {
-  constructor(nodes, gw) {
-    this.n = nodes.length;
-    const p = this.pts = new Float32Array(this.n * 2);
-    for (let i = 0; i < this.n; i++) {
-      const k = nodes[i];
-      p[i*2]     = (k % gw) / Q4;
-      p[i*2 + 1] = ((k / gw) | 0) / Q4;
-    }
-    this.shapes = new Set();
-    this.spline = null;
-    this.smooth = null;
-  }
-  fitSpline() {
-    if (this.n < 3) return;
-    this.spline = ClosedBSpline.fit(this.pts, this.n, 2);
-  }
-}
-
-// ============================================================================
-// Closed quadratic B-spline (Float64Array-backed).
-// ============================================================================
-class ClosedBSpline {
-  constructor(knots, cps, degree, unwrap) {
-    this.knots = knots; this.cps = cps; this.degree = degree;
-    this.n = cps.length / 2; this.unwrap = unwrap;
-    this._d1 = null;
-  }
-  static fit(pts, nPts, degree) {
-    const n = nPts + degree, m = n + degree;
-    const knots = new Float64Array(m + 1);
-    for (let i = 0; i <= m; i++) knots[i] = i / m;
-    const cps = new Float64Array(n * 2);
-    for (let i = 0; i < nPts; i++) { cps[i*2] = pts[i*2]; cps[i*2+1] = pts[i*2+1]; }
-    for (let i = 0; i < degree; i++) {
-      cps[(nPts + i)*2]     = pts[i*2];
-      cps[(nPts + i)*2 + 1] = pts[i*2 + 1];
-    }
-    return new ClosedBSpline(knots, cps, degree, nPts);
-  }
-  copy() {
-    return new ClosedBSpline(
-      new Float64Array(this.knots),
-      new Float64Array(this.cps),
-      this.degree, this.unwrap);
-  }
-  cpSet(i, x, y) {
-    i = ((i % this.unwrap) + this.unwrap) % this.unwrap;
-    this.cps[i*2] = x; this.cps[i*2+1] = y;
-    if (i < this.degree) {
-      const j = i + this.unwrap;
-      this.cps[j*2] = x; this.cps[j*2+1] = y;
-    }
-    this._d1 = null;
-  }
-  // de Boor — writes into result[0..1]
-  evalAt(u, result) {
-    const p = this.degree, knots = this.knots, cps = this.cps;
-    let k;
-    if (u <= knots[p]) k = p;
-    else if (u >= knots[this.n]) k = this.n - 1;
-    else {
-      let lo = p, hi = this.n;
-      while (lo < hi - 1) { const mid = (lo + hi) >> 1; (u < knots[mid]) ? hi = mid : lo = mid; }
-      k = lo;
-    }
-    // inlined small allocations: for p<=2 we only need 3 points
-    const i0 = 2 * (k - p), i1 = i0 + 2, i2 = i0 + 4;
-    let dx0 = cps[i0], dy0 = cps[i0+1];
-    let dx1 = cps[i1], dy1 = cps[i1+1];
-    let dx2 = p >= 2 ? cps[i2]   : 0;
-    let dy2 = p >= 2 ? cps[i2+1] : 0;
-    if (p === 2) {
-      // r=1: update (1), (2)
-      let a = (u - knots[k - 1]) / (knots[k + 1] - knots[k - 1]);
-      dx1 = (1 - a) * dx0 + a * dx1; dy1 = (1 - a) * dy0 + a * dy1;
-      a   = (u - knots[k    ]) / (knots[k + 2] - knots[k    ]);
-      dx2 = (1 - a) * cps[i1] /* old */ + a * dx2; dy2 = (1 - a) * cps[i1+1] + a * dy2;
-      // r=2: final
-      a   = (u - knots[k    ]) / (knots[k + 1] - knots[k    ]);
-      result[0] = (1 - a) * dx1 + a * dx2;
-      result[1] = (1 - a) * dy1 + a * dy2;
-      return;
-    } else if (p === 1) {
-      const a = (u - knots[k]) / (knots[k + 1] - knots[k]);
-      result[0] = (1 - a) * dx0 + a * dx1;
-      result[1] = (1 - a) * dy0 + a * dy1;
-      return;
-    } else if (p === 0) {
-      result[0] = dx0; result[1] = dy0; return;
-    }
-    // Generic path (not hit for our use).
-    const dX = new Float64Array(p + 1), dY = new Float64Array(p + 1);
-    for (let i = 0; i <= p; i++) {
-      dX[i] = cps[2*(k - p + i)]; dY[i] = cps[2*(k - p + i) + 1];
-    }
-    for (let r = 1; r <= p; r++) for (let i = p; i >= r; i--) {
-      const j = k - p + i;
-      const a = (u - knots[j]) / (knots[j + p - r + 1] - knots[j]);
-      dX[i] = (1 - a) * dX[i-1] + a * dX[i];
-      dY[i] = (1 - a) * dY[i-1] + a * dY[i];
-    }
-    result[0] = dX[p]; result[1] = dY[p];
-  }
-  derivative() {
-    if (this._d1) return this._d1;
-    const p = this.degree, n = this.n;
-    const nc = new Float64Array((n - 1) * 2);
-    for (let i = 0; i < n - 1; i++) {
-      const c = p / (this.knots[i + 1 + p] - this.knots[i + 1]);
-      nc[i*2]     = c * (this.cps[(i+1)*2]     - this.cps[i*2]);
-      nc[i*2 + 1] = c * (this.cps[(i+1)*2 + 1] - this.cps[i*2 + 1]);
-    }
-    const nk = this.knots.slice(1, this.knots.length - 1);
-    this._d1 = new ClosedBSpline(nk, nc, p - 1, this.unwrap);
-    return this._d1;
-  }
-  // Write beziers into out[] as flat 6-tuples (sx,sy,cx,cy,ex,ey). Returns count.
-  toBeziers(out) {
-    const p = this.degree;
-    const tmp = TMP2;
-    this.evalAt(this.knots[p], tmp);
-    let sx = tmp[0], sy = tmp[1];
-    const count = this.n - p;
-    for (let k = 0; k < count; k++) {
-      const cx = this.cps[(k + 1) * 2];
-      const cy = this.cps[(k + 1) * 2 + 1];
-      this.evalAt(this.knots[p + 1 + k], tmp);
-      const ex = tmp[0], ey = tmp[1];
-      const base = k * 6;
-      out[base  ] = sx; out[base+1] = sy;
-      out[base+2] = cx; out[base+3] = cy;
-      out[base+4] = ex; out[base+5] = ey;
-      sx = ex; sy = ey;
-    }
-    return count;
-  }
-  reversed() {
-    const p = this.degree, n = this.n;
-    const nk = new Float64Array(this.knots.length);
-    for (let i = 0; i < nk.length; i++) nk[i] = 1 - this.knots[nk.length - 1 - i];
-    const nc = new Float64Array(this.cps.length);
-    for (let i = 0; i < n; i++) {
-      nc[i*2]     = this.cps[(n - 1 - i) * 2];
-      nc[i*2 + 1] = this.cps[(n - 1 - i) * 2 + 1];
-    }
-    return new ClosedBSpline(nk, nc, p, this.unwrap);
-  }
-}
-const TMP2 = new Float64Array(2);
-
-// ============================================================================
-// Spline smoother — random-relaxation. Hot loop operates on Float64Arrays
-// directly with zero per-iteration allocation.
-// ============================================================================
-function smoothSpline(original, opts) {
-  const iterations  = opts.iterations   ?? 20;
-  const guesses     = opts.guesses      ?? 20;
-  const guessOffset = opts.guessOffset  ?? 0.05;
-  const N_INT = 20;
-
-  const s = original.copy();
-  const U = s.unwrap, p = s.degree, knots = s.knots;
-  const d1 = new Float64Array(2), d2 = new Float64Array(2);
-  const domLo = knots[p], domHi = knots[s.n];
-
-  function curvature(u) {
-    const D1 = s.derivative();
-    const D2 = D1.derivative();
-    D1.evalAt(u, d1); D2.evalAt(u, d2);
-    const x1 = d1[0], y1 = d1[1], x2 = d2[0], y2 = d2[1];
-    const num = x1 * y2 - y1 * x2;
-    const q = x1 * x1 + y1 * y1;
-    const den = q * Math.sqrt(q);
-    return den === 0 ? 0 : Math.abs(num / den);
-  }
-
-  function energyAt(i) {
-    const ox = original.cps[i*2], oy = original.cps[i*2 + 1];
-    const cx = s.cps[i*2],        cy = s.cps[i*2 + 1];
-    const dx = cx - ox, dy = cy - oy;
-    const dsq = dx * dx + dy * dy;
-    let E = dsq * dsq;
-    for (let r = 0; r < p; r++) {
-      let lo = knots[i + 1 + r], hi = knots[i + 2 + r];
-      if (lo < domLo) lo = domLo; else if (lo > domHi) lo = domHi;
-      if (hi < domLo) hi = domLo; else if (hi > domHi) hi = domHi;
-      if (lo === hi) continue;
-      const step = (hi - lo) / N_INT;
-      let acc = 0.5 * (curvature(lo) + curvature(hi));
-      for (let j = 1; j < N_INT; j++) acc += curvature(lo + j * step);
-      E += acc * step;
-    }
-    return E;
-  }
-
-  for (let it = 0; it < iterations; it++) {
-    for (let i = 0; i < U; i++) {
-      const sx = s.cps[i*2], sy = s.cps[i*2 + 1];
-      let bestE = energyAt(i), bx = sx, by = sy;
-      for (let k = 0; k < guesses; k++) {
-        const r = Math.random() * guessOffset;
-        const th = Math.random() * PI2;
-        const cx = sx + r * Math.cos(th), cy = sy + r * Math.sin(th);
-        s.cpSet(i, cx, cy);
-        const e = energyAt(i);
-        if (e < bestE) { bestE = e; bx = cx; by = cy; }
+      if (c.att1 >= 0) {
+        const n = c.n;
+        nodePt(C[c.att1], c.att1j, T);
+        delta = Math.max(delta, Math.abs(T[0] - c.x[n]) + Math.abs(T[1] - c.y[n]));
+        c.x[n] = T[0]; c.y[n] = T[1];
       }
-      s.cpSet(i, bx, by);
+    }
+    return delta;
+  }
+
+  // Settle attachments and compute the rendered position of every node.
+  finalize() {
+    for (let p = 0; p < 64; p++) if (this._updateAttachments() < 1e-12) break;
+    const NN = this.nodeCount, X = this.nodeX, Y = this.nodeY;
+    const qx = this.qx = new Float64Array(NN), qy = this.qy = new Float64Array(NN);
+    for (let v = 0; v < NN; v++) { qx[v] = X[v] * 0.25; qy[v] = Y[v] * 0.25; }
+    for (const c of this.curves) {
+      const M = c.nodes.length;
+      for (let k = 0; k < M; k++) { nodePt(c, k, _T); qx[c.nodes[k]] = _T[0]; qy[c.nodes[k]] = _T[1]; }
     }
   }
-  return s;
+
+  // Structural self-check used by the tests.
+  validate() {
+    const { N, cellV: V, cellN: CN, nodeX: X, nodeY: Y } = this;
+    let area = 0;
+    for (let i = 0; i < N; i++) {
+      const n = CN[i];
+      for (let k = 0; k < n; k++) {
+        const a = V[i * 8 + k], b = V[i * 8 + (k + 1) % n];
+        area += X[a] * Y[b] - X[b] * Y[a];
+      }
+    }
+    const problems = [];
+    if (Math.abs(area / 32 - N) > 1e-9) problems.push('cell area ' + area / 32 + ' != ' + N);
+    for (let r = 0; r < this.R; r++) {
+      const pos = this.rLoops[r].filter(l => this.loops[l].area > 0).length;
+      if (pos !== 1) problems.push('region ' + r + ' has ' + pos + ' outer loops');
+    }
+    return problems;
+  }
 }
+const _T = new Float64Array(2);
 
 // ============================================================================
-// SVG writer. Assembles one big string from pre-stringified tokens and
-// lookup tables. No per-pixel number-to-string coercion in the hot path.
+// SVG writer
 // ============================================================================
+let FALLBACK_UID = 0;
+function hashId(pd, o) {
+  let h = 0x811c9dc5;
+  const mix = v => { h ^= v; h = Math.imul(h, 0x01000193); };
+  mix(pd.w); mix(pd.h);
+  const k = pd.key;
+  for (let i = 0; i < k.length; i++) mix(k[i]);
+  const s = [o.scale, o.mode, o.shading, o.smooth, o.iterations, o.guesses, o.guessOffset, o.seed].join('|');
+  for (let i = 0; i < s.length; i++) mix(s.charCodeAt(i));
+  return (h >>> 0).toString(36);
+}
+function hex(c) { return '#' + (c | 0x1000000).toString(16).slice(1); }
+
 class SVGWriter {
-  constructor(pd, scale) {
-    this.pd = pd; this.scale = scale;
-    // Pre-render strings for all quarter-pixel-aligned coordinates.
-    // After deformation every corner is a multiple of Q4; after smoothing
-    // they drift slightly but still often land near quarter-pixels, so
-    // this table hits often and saves toString() cost.
-    const maxQ = Math.max(pd.w, pd.h) * Q4 + Q4;
-    this.qStr = new Array(maxQ + 1);
-    const S = scale;
-    for (let i = 0; i <= maxQ; i++) {
-      const v = (i / Q4) * S;
-      this.qStr[i] = Number.isInteger(v) ? v.toString() : v.toFixed(1);
-    }
-    // Pre-render RGB strings per unique color.
-    this.colorStr = new Map();
-    for (let i = 0; i < pd.rgb.length; i++) {
-      const c = pd.rgb[i];
-      if (!this.colorStr.has(c)) {
-        this.colorStr.set(c,
-          'rgb(' + ((c >> 16) & 255) + ',' + ((c >> 8) & 255) + ',' + (c & 255) + ')');
-      }
-    }
-    // Pre-rendered "scale" string used by the NN backdrop.
-    this.scaleStr = String(S);
+  constructor(pd, opts = {}) {
+    this.pd = pd;
+    this.S = +opts.scale > 0 ? +opts.scale : DEFAULTS.scale;
+    this.k10 = this.S * 10;
+    this.sigma = Math.max(0, +(opts.shading ?? DEFAULTS.shading) || 0);
+    this.id = opts.idPrefix || ('dpx' + (pd.key ? hashId(pd, opts) : ++FALLBACK_UID) + '-');
+    // Each opaque fill is also stroked with its own colour, ~1.2 screen pixels
+    // wide at any zoom (non-scaling stroke): a region painted later then covers
+    // the anti-aliased seam of the one below, so no background shows through.
+    this.strokeW = 1.2;
+    this.cmd = '';
+    this.T = new Float64Array(2); this.U = new Float64Array(2);
   }
-  _col(c) { return this.colorStr.get(c); }
-  _num(v) {
-    // Hot path: quarter-pixel-aligned values hit the lookup table.
-    const q = v * Q4;
-    const qi = (q + 0.5) | 0;
-    if (Math.abs(q - qi) < 1e-4 && qi >= 0 && qi < this.qStr.length) {
-      return this.qStr[qi];
-    }
-    const scaled = v * this.scale;
-    const rounded = Math.round(scaled * 10) / 10;
-    return rounded.toString();
+
+  num(v) { return '' + Math.round(v * this.k10) / 10; }        // pixel units → SVG units
+  _M(out, x, y) { out.push('M', this.num(x), ' ', this.num(y)); this.cmd = 'M'; }
+  _L(out, x, y) { out.push(this.cmd === 'L' ? ' ' : 'L', this.num(x), ' ', this.num(y)); this.cmd = 'L'; }
+  _Q(out, cx, cy, x, y) {
+    out.push(this.cmd === 'Q' ? ' ' : 'Q', this.num(cx), ' ', this.num(cy), ' ', this.num(x), ' ', this.num(y));
+    this.cmd = 'Q';
   }
+  _Z(out) { out.push('Z'); this.cmd = ''; }
 
   render() {
-    const pd = this.pd, S = this.scale;
-    const W = pd.w * S, H = pd.h * S;
-    const out = [];
+    const pd = this.pd, S = this.S, out = [];
+    const W = '' + Math.round(pd.w * S * 10) / 10, H = '' + Math.round(pd.h * S * 10) / 10;
     out.push('<svg xmlns="http://www.w3.org/2000/svg" width="', W, '" height="', H,
-             '" viewBox="0 0 ', W, ' ', H, '" shape-rendering="geometricPrecision">');
-
-    // 1) Nearest-neighbor backdrop (every pixel as a square).
-    this._emitBackdrop(out);
-
-    // 2) Clipped smoothed silhouettes over big shapes.
-    this._emitShapes(out);
-
-    out.push('</svg>');
+             '" viewBox="0 0 ', W, ' ', H, '">');
+    const exact = !pd.opaque;            // holes must be cut when something is see-through
+    const order = [];
+    for (let r = 0; r < pd.R; r++) if (pd.rKind[r] !== 2) order.push(r);
+    order.sort((a, b) => pd.rArea[b] - pd.rArea[a] || a - b);
+    // Multi-colour regions get smooth shading. Regions whose blurs cannot
+    // interact share one mask + filter (a batch), which keeps the number of
+    // offscreen layers small; a batch is painted at its last member's slot,
+    // with holes cut, so painter's order stays valid.
+    const smooth = this.sigma > 0, batchOf = new Int32Array(pd.R).fill(-1), batches = [];
+    if (smooth) {
+      const D = Math.ceil(3 * this.sigma) + 2;
+      for (let oi = 0; oi < order.length; oi++) {
+        const r = order[oi];
+        if (!pd.rMulti[r] || pd.rKind[r] !== 0) continue;
+        const bb = this._bbox(r);
+        let b = 0;
+        for (; b < batches.length; b++) {
+          let ok = true;
+          for (const q of batches[b].boxes) {
+            if (bb[0] - D <= q[2] && q[0] <= bb[2] + D && bb[1] - D <= q[3] && q[1] <= bb[3] + D) { ok = false; break; }
+          }
+          if (ok) break;
+        }
+        if (b === batches.length) batches.push({ members: [], boxes: [], last: -1 });
+        batches[b].members.push(r); batches[b].boxes.push(bb); batches[b].last = oi;
+        batchOf[r] = b;
+      }
+      if (batches.length) {
+        out.push('<defs><filter id="', this.id, 'f" x="-10%" y="-10%" width="120%" height="120%"',
+                 ' color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="',
+                 '' + Math.round(this.sigma * S * 100) / 100,
+                 '"/><feComponentTransfer><feFuncA type="linear" slope="40"/></feComponentTransfer></filter></defs>');
+      }
+    }
+    out.push('<g stroke-width="', '' + this.strokeW, '" stroke-linejoin="round"', exact ? ' fill-rule="evenodd"' : '', '>');
+    for (let oi = 0; oi < order.length; oi++) {
+      const r = order[oi];
+      if (batchOf[r] >= 0) {
+        const B = batches[batchOf[r]];
+        if (B.last === oi) this._smoothBatch(out, B, batchOf[r]);
+        continue;
+      }
+      if (pd.rMulti[r]) { this._cellRegion(out, r); continue; }
+      const p0 = pd.rPix[pd.rStart[r]];
+      this._paint(out, pd.rgb[p0], pd.alpha[p0]);
+      out.push(' d="');
+      this._regionPath(out, r, exact);
+      out.push('"/>');
+    }
+    out.push('</g></svg>');
     return out.join('');
   }
 
-  _emitBackdrop(out) {
-    const pd = this.pd, S = this.scale, sStr = this.scaleStr;
-    const xS = new Array(pd.w + 1);    // pre-stringified pixel x positions
-    const yS = new Array(pd.h + 1);
-    for (let x = 0; x <= pd.w; x++) xS[x] = (x * S).toString();
-    for (let y = 0; y <= pd.h; y++) yS[y] = (y * S).toString();
-    const rgb = pd.rgb;
-    // Row-merging: contiguous same-color pixels become one rect. Shrinks
-    // output size a lot on classic pixel art and photos with large flats.
-    for (let y = 0; y < pd.h; y++) {
-      let x = 0;
-      while (x < pd.w) {
-        const c = rgb[y * pd.w + x];
-        let x2 = x + 1;
-        while (x2 < pd.w && rgb[y * pd.w + x2] === c) x2++;
-        const ww = (x2 - x) * S;
-        out.push('<rect x="', xS[x], '" y="', yS[y],
-                 '" width="', ww, '" height="', sStr,
-                 '" fill="', this._col(c), '" shape-rendering="crispEdges"/>');
-        x = x2;
-      }
+  // Opening of a <path> filled (and seam-stroked) with one colour.
+  _paint(out, rgb, a) {
+    const c = hex(rgb);
+    if (a === 255) out.push('<path fill="', c, '" stroke="', c, '" vector-effect="non-scaling-stroke"');
+    else out.push('<path fill="', c, '" fill-opacity="', '' + Math.round(a / 2.55) / 100, '"');
+  }
+
+  _regionPath(out, r, exact) {
+    const pd = this.pd;
+    for (const l of pd.rLoops[r]) {
+      const L = pd.loops[l];
+      if (exact || L.area > 0) this._loop(out, L);
     }
   }
 
-  _emitShapes(out) {
-    const MIN_SMOOTH_PIXELS = 4;
-    const pd = this.pd;
-    const shapes = pd.shapes.slice().sort((a, b) => b.pixels.length - a.pixels.length);
-    let bezBuf = new Float32Array(256 * 6);
-
-    // Build clip-path definitions for shapes large enough to benefit.
-    out.push('<defs>');
-    const shapeId = new Map();
-    for (let i = 0; i < shapes.length; i++) {
-      const s = shapes[i];
-      if (!s.outer || !s.outer.smooth || s.pixels.length < MIN_SMOOTH_PIXELS) continue;
-      const id = 'c' + i;
-      shapeId.set(s, id);
-      const splines = [s.outer.smooth.reversed()];
-      for (const h of s.holes) if (h.smooth) splines.push(h.smooth);
-      out.push('<clipPath id="', id, '" clip-rule="evenodd"><path d="');
-      bezBuf = this._appendSplines(out, splines, bezBuf);
-      out.push('"/></clipPath>');
+  _bbox(r) {
+    const pd = this.pd, w = pd.w, pix = pd.rPix;
+    let x0 = w, y0 = pd.h, x1 = 0, y1 = 0;
+    for (let p = pd.rStart[r]; p < pd.rStart[r + 1]; p++) {
+      const i = pix[p], x = i % w, y = (i / w) | 0;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
     }
-    out.push('</defs>');
+    return [x0, y0, x1, y1];
+  }
 
-    // Emit each big shape: backdrop (avg color) + per-cell overlays.
-    for (const s of shapes) {
-      const id = shapeId.get(s);
-      if (!id) continue;
-      // Average color.
-      let ar = 0, ag = 0, ab = 0;
-      const rgb = pd.rgb;
-      for (let k = 0; k < s.pixels.length; k++) {
-        const c = rgb[s.pixels[k]];
-        ar += (c >> 16) & 255; ag += (c >> 8) & 255; ab += c & 255;
+  // Smooth multi-colour regions: the pixels are blurred and renormalised
+  // (an edge-aware Gaussian interpolation, since only the region's own pixels
+  // contribute) and masked by the region outline. The mask is stroked so the
+  // region slightly overlaps whatever was painted before it (no seams).
+  _smoothBatch(out, B, b) {
+    const pd = this.pd, S = this.S, w = pd.w, pix = pd.rPix, rgb = pd.rgb, id = this.id + 'm' + b;
+    out.push('<mask id="', id, '"><path fill="#fff" stroke="#fff" vector-effect="non-scaling-stroke" fill-rule="evenodd" d="');
+    for (const r of B.members) this._regionPath(out, r, true);
+    out.push('"/></mask><g mask="url(#', id, ')"><g filter="url(#', this.id, 'f)" stroke="none">');
+    let x0 = w, y0 = pd.h, x1 = 0, y1 = 0;
+    for (const q of B.boxes) {
+      if (q[0] < x0) x0 = q[0]; if (q[1] < y0) y0 = q[1]; if (q[2] > x1) x1 = q[2]; if (q[3] > y1) y1 = q[3];
+    }
+    // Invisible margin: makes the filter and mask regions cover the outlines.
+    out.push('<rect x="', '' + (x0 - 2) * S, '" y="', '' + (y0 - 2) * S, '" width="', '' + (x1 - x0 + 5) * S,
+             '" height="', '' + (y1 - y0 + 5) * S, '" fill="none"/>');
+    for (const r of B.members) {
+      const a = pd.rStart[r], e = pd.rStart[r + 1];
+      for (let p = a; p < e;) {
+        const i = pix[p], c = rgb[i], y = (i / w) | 0;
+        let q = p + 1;
+        while (q < e && pix[q] === pix[q - 1] + 1 && rgb[pix[q]] === c && ((pix[q] / w) | 0) === y) q++;
+        out.push('<rect x="', '' + (i % w) * S, '" y="', '' + y * S, '" width="', '' + (q - p) * S,
+                 '" height="', '' + S, '" fill="', hex(c), '"/>');
+        p = q;
       }
-      const n = s.pixels.length;
-      const avg = 'rgb(' + ((ar/n) | 0) + ',' + ((ag/n) | 0) + ',' + ((ab/n) | 0) + ')';
-      const splines = [s.outer.smooth.reversed()];
-      for (const h of s.holes) if (h.smooth) splines.push(h.smooth);
-      out.push('<g clip-path="url(#', id, ')"><path fill="', avg, '" fill-rule="evenodd" d="');
-      bezBuf = this._appendSplines(out, splines, bezBuf);
+    }
+    out.push('</g></g>');
+  }
+
+  // Multi-colour region, flat: every pixel cell is drawn, with its visible
+  // edges replaced by the shared curve pieces.
+  _cellRegion(out, r) {
+    const pd = this.pd;
+    for (let p = pd.rStart[r]; p < pd.rStart[r + 1]; p++) {
+      const i = pd.rPix[p];
+      this._paint(out, pd.rgb[i], pd.alpha[i]);
+      out.push(' d="');
+      this._cellPath(out, i);
       out.push('"/>');
-      // Per-cell overlays.
-      for (let k = 0; k < s.pixels.length; k++) {
-        const pi = s.pixels[k];
-        const col = this._col(rgb[pi]);
-        out.push('<path fill="', col, '" stroke="', col,
-                 '" stroke-width="1.5" stroke-linejoin="round" d="');
-        this._appendCellPolygon(out, pi);
-        out.push('"/>');
-      }
-      out.push('</g>');
     }
   }
 
-  _appendSplines(out, splines, bezBuf) {
-    for (const spline of splines) {
-      if (!spline) continue;
-      const need = (spline.n - spline.degree) * 6;
-      if (need > bezBuf.length) bezBuf = new Float32Array(need);
-      const count = spline.toBeziers(bezBuf);
-      if (!count) continue;
-      out.push('M', this._num(bezBuf[0]), ',', this._num(bezBuf[1]));
-      for (let k = 0; k < count; k++) {
-        const o = k * 6;
-        out.push('Q', this._num(bezBuf[o+2]), ',', this._num(bezBuf[o+3]),
-                 ' ', this._num(bezBuf[o+4]), ',', this._num(bezBuf[o+5]));
+  _cellPath(out, i) {
+    const pd = this.pd, base = i * 8, n = pd.cellN[i], V = pd.cellV, EO = pd.edgeOf, qx = pd.qx, qy = pd.qy;
+    this._M(out, qx[V[base]], qy[V[base]]);
+    for (let k = 0; k < n; k++) {
+      const s = base + k, e = EO[s];
+      if (e < 0) {
+        const v1 = V[base + (k + 1 === n ? 0 : k + 1)];
+        this._L(out, qx[v1], qy[v1]);
+        continue;
       }
-      out.push('Z');
+      const c = pd.curves[pd.curveOf[e]], j = pd.idxOf[e], d = V[s] === c.nodes[j] ? 1 : -1;
+      let a = d > 0 ? j : j + 1;
+      if (c.closed && a === c.n) a = 0;
+      this._run(out, c, a, 1, d);
     }
-    return bezBuf;
+    this._Z(out);
   }
 
-  _appendCellPolygon(out, pi) {
-    const pd = this.pd;
-    const buf = CELL_BUF, angBuf = CELL_ANG;
-    let n = 0;
-    let cx = 0, cy = 0;
-    if (pd.cornerOver && pd.cornerOver.has(pi)) {
-      for (const k of pd.cornerOver.get(pi)) {
-        const vx = (k % pd.gw) / Q4, vy = ((k / pd.gw) | 0) / Q4;
-        buf[n*2] = vx; buf[n*2 + 1] = vy; cx += vx; cy += vy; n++;
+  // One boundary loop: a cyclic list of visible half-edges, emitted as runs
+  // along the shared curves.
+  _loop(out, L) {
+    const pd = this.pd, slots = L.slots, m = slots.length;
+    const C = pd.curves, EO = pd.edgeOf, CO = pd.curveOf, IO = pd.idxOf, V = pd.cellV;
+    if (!this.hc || this.hc.length < m) {
+      const cap = Math.max(m, 64);
+      this.hc = new Int32Array(cap); this.hj = new Int32Array(cap); this.hd = new Int8Array(cap);
+    }
+    const hc = this.hc, hj = this.hj, hd = this.hd;
+    for (let t = 0; t < m; t++) {
+      const s = slots[t], e = EO[s], c = CO[e], j = IO[e];
+      hc[t] = c; hj[t] = j; hd[t] = V[s] === C[c].nodes[j] ? 1 : -1;
+    }
+    const cont = (a, b) => {
+      if (hc[a] !== hc[b] || hd[a] !== hd[b]) return false;
+      const c = C[hc[a]];
+      let j = hj[a] + hd[a];
+      if (c.closed) { if (j < 0) j += c.n; else if (j >= c.n) j -= c.n; }
+      return j === hj[b];
+    };
+    let s0 = -1;
+    for (let t = 0; t < m; t++) if (!cont(t === 0 ? m - 1 : t - 1, t)) { s0 = t; break; }
+    if (s0 < 0) { this._fullCurve(out, C[hc[0]]); return; }
+    let t = s0, first = true;
+    do {
+      let cnt = 1;
+      while (cnt < m) {
+        const b = (t + cnt) % m;
+        if (b === s0 || !cont((t + cnt - 1) % m, b)) break;
+        cnt++;
+      }
+      const c = C[hc[t]], d = hd[t];
+      let a0 = d > 0 ? hj[t] : hj[t] + 1;
+      if (c.closed && a0 === c.n) a0 = 0;
+      if (first) { nodePt(c, a0, this.T); this._M(out, this.T[0], this.T[1]); first = false; }
+      this._run(out, c, a0, cnt, d);
+      t = (t + cnt) % m;
+    } while (t !== s0);
+    this._Z(out);
+  }
+
+  // A loop made of one complete closed curve.
+  _fullCurve(out, c) {
+    if (c.border) {
+      this._M(out, c.x[0], c.y[0]);
+      this._run(out, c, 0, c.n, 1);
+      this._Z(out);
+      return;
+    }
+    const T = this.T, x = c.x, y = c.y;
+    segA(c, 0, T);
+    this._M(out, T[0], T[1]);
+    for (let s = 0; s < c.n; s++) { segC(c, s, T); this._Q(out, x[s], y[s], T[0], T[1]); }
+    this._Z(out);
+  }
+
+  // Emit `cnt` edges of curve c starting at control point a, direction d (±1).
+  _run(out, c, a, cnt, d) {
+    const x = c.x, y = c.y, n = c.n, closed = c.closed, M = c.nodes.length;
+    if (c.border || (!closed && n === 1)) {
+      // Straight pieces (image frame, or a single edge between two junctions);
+      // collinear points are merged.
+      let lx = x[a], ly = y[a], px = lx, py = ly, has = false;
+      for (let t = 1; t <= cnt; t++) {
+        let k = a + d * t;
+        if (closed) { k %= M; if (k < 0) k += M; }
+        const qx = x[k], qy = y[k];
+        if (has && Math.abs((px - lx) * (qy - py) - (py - ly) * (qx - px)) > 1e-9) {
+          this._L(out, px, py); lx = px; ly = py;
+        }
+        px = qx; py = qy; has = true;
+      }
+      if (has) this._L(out, px, py);
+      return;
+    }
+    const T = this.T, U = this.U;
+    const has = s => closed || (s >= 1 && s <= n - 1);
+    const wrap = s => closed ? ((s % n) + n) % n : s;
+    if (d > 0) {
+      if (has(a)) { const s = wrap(a); segC(c, s, T); this._Q(out, (x[s] + T[0]) * 0.5, (y[s] + T[1]) * 0.5, T[0], T[1]); }
+      for (let t = 1; t < cnt; t++) { const s = wrap(a + t); segC(c, s, T); this._Q(out, x[s], y[s], T[0], T[1]); }
+      const b = a + cnt;
+      if (has(b)) {
+        const s = wrap(b); segA(c, s, T); nodePt(c, s, U);
+        this._Q(out, (T[0] + x[s]) * 0.5, (T[1] + y[s]) * 0.5, U[0], U[1]);
       }
     } else {
-      const base = pi * 8, cnt = pd.cornerCount[pi];
-      for (let j = 0; j < cnt; j++) {
-        const k = pd.cornerBuf[base + j];
-        const vx = (k % pd.gw) / Q4, vy = ((k / pd.gw) | 0) / Q4;
-        buf[n*2] = vx; buf[n*2 + 1] = vy; cx += vx; cy += vy; n++;
+      if (has(a)) { const s = wrap(a); segA(c, s, T); this._Q(out, (T[0] + x[s]) * 0.5, (T[1] + y[s]) * 0.5, T[0], T[1]); }
+      for (let t = 1; t < cnt; t++) { const s = wrap(a - t); segA(c, s, T); this._Q(out, x[s], y[s], T[0], T[1]); }
+      const b = a - cnt;
+      if (has(b)) {
+        const s = wrap(b); segC(c, s, T); nodePt(c, s, U);
+        this._Q(out, (x[s] + T[0]) * 0.5, (y[s] + T[1]) * 0.5, U[0], U[1]);
       }
     }
-    if (n < 3) return;
-    cx /= n; cy /= n;
-    // Angular sort around centroid (insertion sort on small n is fast).
-    for (let i = 0; i < n; i++) {
-      angBuf[i] = Math.atan2(buf[i*2 + 1] - cy, buf[i*2] - cx);
-    }
-    for (let i = 1; i < n; i++) {
-      const aAng = angBuf[i], ax = buf[i*2], ay = buf[i*2 + 1];
-      let j = i - 1;
-      while (j >= 0 && angBuf[j] > aAng) {
-        angBuf[j+1] = angBuf[j];
-        buf[(j+1)*2] = buf[j*2]; buf[(j+1)*2 + 1] = buf[j*2 + 1];
-        j--;
-      }
-      angBuf[j+1] = aAng; buf[(j+1)*2] = ax; buf[(j+1)*2 + 1] = ay;
-    }
-    out.push('M', this._num(buf[0]), ',', this._num(buf[1]));
-    for (let i = 1; i < n; i++) out.push('L', this._num(buf[i*2]), ',', this._num(buf[i*2 + 1]));
-    out.push('Z');
   }
 }
-// Scratch for cell polygon rendering — cells max 8 corners, rarely more.
-const CELL_BUF = new Float32Array(32);
-const CELL_ANG = new Float32Array(16);
 
 // ============================================================================
 // Public entry point
 // ============================================================================
 function depixelize(image, opts = {}) {
-  const { scale = 40, smooth = true } = opts;
-  const pd = new PixelData(image.width, image.height, image.data);
-  if (smooth !== false) {
-    for (const path of pd.paths) path.fitSpline();
-    for (const path of pd.paths) {
-      if (!path.spline) continue;
-      if (path.shapes.size === 1) path.smooth = path.spline.copy();
-      else                        path.smooth = smoothSpline(path.spline, opts);
-    }
-  }
-  return new SVGWriter(pd, scale).render();
+  const o = {};
+  for (const k in DEFAULTS) o[k] = opts[k] !== undefined && opts[k] !== null ? opts[k] : DEFAULTS[k];
+  if (opts.idPrefix) o.idPrefix = opts.idPrefix;
+  const pd = new PixelData(image.width, image.height, image.data, o);
+  if (o.smooth !== false) pd.optimize(o);
+  pd.finalize();
+  return new SVGWriter(pd, o).render();
 }
 
-// ============================================================================
-// Exports
-// ============================================================================
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { depixelize, PixelData, SVGWriter, ClosedBSpline, smoothSpline };
+  module.exports = { depixelize, PixelData, SVGWriter, DEFAULTS };
 }
 if (typeof window !== 'undefined') window.depixelize = depixelize;

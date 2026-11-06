@@ -30,7 +30,7 @@
 </head>
 <body>
 <h1>Depixelize — browser demo</h1>
-<p class="sub">Drop a small pixel-art PNG (or click to select). Resolution-independent SVG appears on the right.</p>
+<p class="sub">Drop a small pixel-art PNG (or click to select). Resolution-independent SVG appears on the right. Transparent PNGs keep their transparency.</p>
 
 <div class="drop" id="drop">Drop a PNG here, or click to pick a file.</div>
 <input type="file" id="file" accept="image/*" style="display:none">
@@ -38,7 +38,7 @@
 <div class="controls">
   <label>mode
     <select id="mode">
-      <option value="auto">auto</option>
+      <option value="auto">auto (crisp bands, smooth gradients)</option>
       <option value="shape">shape (classic pixel art)</option>
       <option value="cell">cell (photos / gradients)</option>
     </select>
@@ -47,6 +47,7 @@
   <label>iterations <input type="range" id="iter" min="0" max="40" value="20"></label>
   <label>guesses <input type="range" id="guess" min="1" max="40" value="20"></label>
   <label>offset <input type="range" id="off" min="1" max="20" value="5"></label>
+  <label title="Blur radius of the colour interpolation inside multi-colour regions (0 = flat cells)">shading <input type="range" id="shade" min="0" max="150" value="70"></label>
   <label><input type="checkbox" id="smooth" checked> smooth</label>
   <button id="run">Re-run</button>
   <button id="dl">Download SVG</button>
@@ -98,6 +99,7 @@ function run() {
     iterations:  +document.getElementById('iter').value,
     guesses:     +document.getElementById('guess').value,
     guessOffset: +document.getElementById('off').value / 100,
+    shading:     +document.getElementById('shade').value / 100,
     smooth:      document.getElementById('smooth').checked,
   };
   if (modeRaw !== 'auto') opts.mode = modeRaw;
@@ -122,7 +124,7 @@ fileInput.addEventListener('change', e => { if (e.target.files[0]) loadFile(e.ta
 
 // Controls
 document.getElementById('run').addEventListener('click', run);
-for (const id of ['mode','scale','iter','guess','off','smooth']) {
+for (const id of ['mode','scale','iter','guess','off','shade','smooth']) {
   document.getElementById(id).addEventListener('change', run);
 }
 document.getElementById('dl').addEventListener('click', () => {
